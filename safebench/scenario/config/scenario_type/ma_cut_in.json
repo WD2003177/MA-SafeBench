@@ -1,0 +1,42 @@
+[
+  {
+    "data_id": 300,
+    "scenario_folder": "standard",
+    "scenario_id": 3,
+    "route_id": 0,
+    "risk_level": null,
+    "parameters": {
+      "scenario_name": "MultiAgentCutInLeadingVehicle"
+    }
+  },
+  {
+    "data_id": 301,
+    "scenario_folder": "standard",
+    "scenario_id": 3,
+    "route_id": 1,
+    "risk_level": null,
+    "parameters": {
+      "scenario_name": "MultiAgentCutInLeadingVehicle"
+    }
+  },
+  {
+    "data_id": 302,
+    "scenario_folder": "standard",
+    "scenario_id": 3,
+    "route_id": 2,
+    "risk_level": null,
+    "parameters": {
+      "scenario_name": "MultiAgentCutInLeadingVehicle"
+    }
+  },
+  {
+    "data_id": 303,
+    "scenario_folder": "standard",
+    "scenario_id": 3,
+    "route_id": 3,
+    "risk_level": null,
+    "parameters": {
+      "scenario_name": "MultiAgentCutInLeadingVehicle"
+    }
+  }
+]

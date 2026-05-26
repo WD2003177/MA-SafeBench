@@ -1,0 +1,100 @@
+scenario_type_dir: 'safebench/scenario/config/scenario_type'
+scenario_type: 'ma_cut_in.json'
+scenario_category: 'planning'
+policy_type: 'ma'
+
+route_dir: 'safebench/scenario/scenario_data/route'
+scenario_id: 3
+route_id: 0
+
+ego_action_dim: 2
+ego_state_dim: 4
+ego_action_limit: 1.0
+
+model_path: ''
+standard_action: false
+buffer_capacity: 100
+eval_in_train_freq: 10
+save_freq: 10
+train_episode: 100
+
+seed: 0
+ma_seed: 0
+initializer_seed: 0
+use_llm: true
+ma_use_message_pool: true
+ma_llm_model: null
+ma_llm_base_url: null
+ma_llm_timeout_s: 10
+ma_llm_temperature: 0.0
+ma_llm_max_retries: 1
+fallback_policy: 'rule'
+ma_decision_interval_s: 1.0
+ma_trace_enabled: true
+ma_record_step_metrics: true
+ma_force_dummy_action: false
+ma_hard_brake_decel_mps2: -3.0
+ma_near_miss_ttc_s: 1.5
+ma_near_miss_distance_m: 3.0
+ma_cutin_success_gap_m: 12.0
+
+planner:
+  controller_dt: 0.1
+  lookahead_distance_m: 6.0
+  waypoint_spacing_m: 1.5
+  max_plan_horizon_s: 6.0
+  min_plan_horizon_s: 2.0
+  lane_center_offset_m: 0.0
+  spline_smoothing: true
+
+  initializer:
+    normal_speed_mps: 8.0
+    avoid_junction: true
+    min_junction_distance_m: 10.0
+    junction_scan_distance_m: 80.0
+    junction_scan_step_m: 2.0
+    min_route_remaining_m: 50.0
+    min_spawn_separation_m: 4.0
+    max_lane_heading_diff_deg: 30.0
+    side_candidates: ['left', 'right']
+    anchor_distances_m: [30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80]
+    striker_offsets_m: [-8, -4, 0, 4, 8]
+    blocker_offsets_m: [15, 20, 25, 30]
+    actor_models:
+      attacker_1: 'vehicle.audi.tt'
+      blocker_1: 'vehicle.nissan.patrol'
+
+  cut_in_and_brake:
+    target_gap_m: 6.0
+    target_gap_bounds_m: [4.0, 15.0]
+    lane_change_duration_s: 2.5
+    lane_change_duration_bounds_s: [1.8, 5.0]
+    merge_s_offset_m: 12.0
+    merge_s_offset_bounds_m: [8.0, 25.0]
+    target_speed_mps: 9.0
+    brake_decel_mps2: -4.0
+    brake_decel_bounds_mps2: [-6.0, -1.0]
+    brake_start_delay_s: 0.3
+    hold_after_merge_s: 0.5
+    post_brake_duration_s: 1.0
+
+  block_ego_lane:
+    target_gap_m: 15.0
+    target_gap_bounds_m: [10.0, 30.0]
+    speed_delta_mps: -1.0
+    min_speed_mps: 3.0
+    max_decel_mps2: -2.5
+    hold_duration_s: 5.0
+
+  recover:
+    normal_speed_mps: 8.0
+    duration_s: 3.0
+    max_decel_mps2: -2.0
+    front_gap_slowdown_m: 10.0
+    min_front_gap_m: 5.0
+
+  constraints:
+    max_abs_longitudinal_accel_mps2: 6.0
+    max_abs_jerk_mps3: 8.0
+    max_lateral_accel_mps2: 3.5
+    max_heading_error_deg: 45.0
