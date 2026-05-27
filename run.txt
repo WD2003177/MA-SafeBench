@@ -1,171 +1,142 @@
-SafeBench MA online LLM attack run commands
-===========================================
+MA-SafeBench server run commands
+================================
 
-Run from the SafeBench repo root:
+This file is for running MA-SafeBench on the remote server with CARLA 0.9.13.
+It uses the same CARLA port style as your ChatScene run:
 
-cd /Users/wudi/Desktop/project/SafeBench
+- CARLA path: /home/ubuntu/wudi/carla_0.9.13
+- SafeBench path: /home/ubuntu/wudi/ma-safebench
+- CARLA port: 2402
+- Traffic-manager port: 8402
 
-
-1. Static checks that do not need CARLA
---------------------------------------
-
-python3 tools/test_ma_static.py
-
-env PYTHONPYCACHEPREFIX=/tmp/safebench_pycache python3 -m py_compile \
-  safebench/scenario/scenario_policy/ma_attack_policy.py \
-  safebench/scenario/scenario_definition/standard/ma_cut_in_leading_vehicle.py \
-  safebench/scenario/ma/action_adapter.py \
-  safebench/scenario/ma/ma_action_adapter.py \
-  safebench/scenario/ma/llm_client.py \
-  safebench/scenario/ma/intent.py \
-  safebench/scenario/ma/initializer.py \
-  safebench/scenario/ma/metrics.py \
-  safebench/scenario/ma/scene_summary.py \
-  safebench/scenario/ma/planner.py \
-  safebench/scenario/ma/attack_manager.py \
-  safebench/scenario/ma/events.py \
-  tools/test_ma_static.py
+If the repo directory name is different on the server, only change SAFE_ROOT.
 
 
-2. CARLA environment
---------------------
+0. One-time environment check
+-----------------------------
 
-# Set this to your CARLA 0.9.13 install path.
-export CARLA_ROOT="/path/to/carla"
+conda activate safebench
 
-export PYTHONPATH="$PYTHONPATH:${CARLA_ROOT}/PythonAPI/carla"
-export PYTHONPATH="$PYTHONPATH:${CARLA_ROOT}/PythonAPI/carla/agents"
-export PYTHONPATH="$PYTHONPATH:${CARLA_ROOT}/PythonAPI/carla/dist/carla-0.9.13-py3.8-linux-x86_64.egg"
+export SAFE_ROOT=/home/ubuntu/wudi/ma-safebench
+export CARLA_ROOT=/home/ubuntu/wudi/carla_0.9.13
 
-# Terminal A: start CARLA.
+cd "$SAFE_ROOT"
+pip install -r requirements.txt
+pip install -e .
+
+
+1. Terminal A: start CARLA
+--------------------------
+
+# If the tmux session already exists:
+tmux attach -t carla0913
+
+# If it does not exist:
+# tmux new -s carla0913
+
+export CARLA_ROOT=/home/ubuntu/wudi/carla_0.9.13
 cd "$CARLA_ROOT"
-./CarlaUE4.sh -prefernvidia -RenderOffScreen -carla-port=2000
 
-# If you run with desktop rendering instead:
-# ./CarlaUE4.sh -prefernvidia -windowed -carla-port=2000
+./CarlaUE4.sh -prefernvidia -RenderOffScreen -nosound -carla-port=2402 -quality-level=Low
 
 
-3. DeepSeek / OpenAI-compatible LLM env
---------------------------------------
+2. Terminal B: run MA-SafeBench, single route first
+--------------------------------------------------
 
-cd /Users/wudi/Desktop/project/SafeBench
+conda activate safebench
 
+export SAFE_ROOT=/home/ubuntu/wudi/ma-safebench
+export CARLA_ROOT=/home/ubuntu/wudi/carla_0.9.13
+
+export PYTHONPATH="${SAFE_ROOT}:${CARLA_ROOT}/PythonAPI:${CARLA_ROOT}/PythonAPI/carla:${CARLA_ROOT}/PythonAPI/carla/agents:${CARLA_ROOT}/PythonAPI/carla/dist/carla-0.9.13-py3.8-linux-x86_64.egg:${PYTHONPATH}"
+
+# OpenAI-compatible LLM settings. Do not write the real key into git.
 export MA_LLM_API_KEY="sk-b8da07d06a224a8f9ff1e72dff94fb06"
 export MA_LLM_MODEL="deepseek-chat"
 export MA_LLM_BASE_URL="https://api.deepseek.com"
-export MA_LLM_TIMEOUT_S="45"
+export MA_LLM_TIMEOUT_S=45
 
-# If DeepSeek returns 404 for the base URL above, use:
-# export MA_LLM_BASE_URL="https://api.deepseek.com/v1"
+cd "$SAFE_ROOT"
 
-
-4. Run MA online LLM cut-in attack, single route
------------------------------------------------
-
-cd /Users/wudi/Desktop/project/SafeBench
-
-SDL_VIDEODRIVER="dummy" python3 scripts/run.py \
+SDL_VIDEODRIVER=dummy python scripts/run.py \
   --agent_cfg sac.yaml \
   --scenario_cfg ma_cut_in.yaml \
   --mode eval \
   --num_scenario 1 \
   --max_episode_step 300 \
-  --render False \
-  --port 2000 \
-  --tm_port 8000 \
+  --save_video \
+  --port 2402 \
+  --tm_port 8402 \
   --fixed_delta_seconds 0.1 \
-  --exp_name ma_cut_in_llm_single_route \
+  --exp_name ma_cut_in_s3_r0_llm \
   --output_dir log
 
+Notes:
+- ma_cut_in.yaml currently selects scenario_id: 3 and route_id: 0.
+- scripts/run.py does not expose scenario_id/route_id as CLI arguments, so change
+  safebench/scenario/config/ma_cut_in.yaml if you want another route.
+- Do not add "--render False": this repo parses it with type=bool, so the string
+  "False" is still treated as True. Use SDL_VIDEODRIVER=dummy for headless runs.
 
-5. Run MA online LLM cut-in attack, multiple routes
---------------------------------------------------
 
-SDL_VIDEODRIVER="dummy" python3 scripts/run.py \
+3. Terminal B: full route evaluation
+------------------------------------
+
+After the single-route command works, run all routes for scenario 3:
+
+cd "$SAFE_ROOT"
+
+SDL_VIDEODRIVER=dummy python scripts/run.py \
   --agent_cfg sac.yaml \
   --scenario_cfg ma_cut_in_all_routes.yaml \
   --mode eval \
   --num_scenario 1 \
   --max_episode_step 300 \
-  --render False \
-  --port 2000 \
-  --tm_port 8000 \
+  --save_video \
+  --port 2402 \
+  --tm_port 8402 \
   --fixed_delta_seconds 0.1 \
-  --exp_name ma_cut_in_llm_all_routes \
+  --exp_name ma_cut_in_s3_all_routes_llm \
   --output_dir log
 
-
-6. Native SafeBench SAC baseline
---------------------------------
-
-SDL_VIDEODRIVER="dummy" python3 scripts/run.py \
-  --agent_cfg sac.yaml \
-  --scenario_cfg standard.yaml \
-  --mode eval \
-  --num_scenario 1 \
-  --max_episode_step 300 \
-  --render False \
-  --port 2000 \
-  --tm_port 8000 \
-  --fixed_delta_seconds 0.1 \
-  --exp_name native_sac_baseline \
-  --output_dir log
+ma_cut_in_all_routes.yaml currently selects scenario_id: 3 and route_id: null,
+so SafeBench will evaluate all route entries for scenario 3.
 
 
-7. Rule fallback / no external LLM ablation
--------------------------------------------
+4. Useful outputs
+-----------------
 
-# Simplest fallback test: unset the API key. use_llm remains true, but the MA policy
-# cannot call the LLM and falls back to the rule proposal path.
+SafeBench creates logs under:
+
+log/<exp_name>/<exp_name>_sac_ma_seed_0/
+
+Important files:
+
+- eval_results/results.pkl
+- eval_results/records.pkl
+- ma_trace_env_0.jsonl
+- config.json / config.yaml
+
+The MA trace JSONL stores raw LLM decisions, contracts, verifier status, planned
+behaviors, and MA event metrics for the run.
+
+
+5. If you want the no-LLM rule fallback ablation
+------------------------------------------------
+
+Use the same command as section 2, but unset the key and change exp_name:
+
 unset MA_LLM_API_KEY
 
-SDL_VIDEODRIVER="dummy" python3 scripts/run.py \
+SDL_VIDEODRIVER=dummy python scripts/run.py \
   --agent_cfg sac.yaml \
   --scenario_cfg ma_cut_in.yaml \
   --mode eval \
   --num_scenario 1 \
   --max_episode_step 300 \
-  --render False \
-  --port 2000 \
-  --tm_port 8000 \
+  --save_video \
+  --port 2402 \
+  --tm_port 8402 \
   --fixed_delta_seconds 0.1 \
-  --exp_name ma_cut_in_rule_fallback \
+  --exp_name ma_cut_in_s3_r0_rule_fallback \
   --output_dir log
-
-
-8. Optional CarlaViz
---------------------
-
-cd /Users/wudi/Desktop/project/SafeBench/scripts
-sh start_carlaviz.sh
-
-# Then open:
-# http://localhost:8080
-
-
-9. Expected outputs
--------------------
-
-# SafeBench evaluation records:
-log/*/eval/results.pkl
-log/*/eval/records.pkl
-
-# MA trace files:
-log/*/ma_trace_env_0.jsonl
-
-# MA fields are added to records.pkl step records, for example:
-# ma_decision_id
-# ma_active_command_ids
-# ma_active_behaviors
-# ma_verifier_status_code
-# ma_step_ttc
-# ma_step_distance
-# ma_step_ego_accel
-# ma_step_ego_jerk
-# ma_event_cutin_success
-# ma_event_hard_brake
-# ma_event_near_miss
-# ma_event_realism_valid_attack
-
-# Raw LLM response/proposal/BehaviorIR/PlannedBehavior summaries go to ma_trace_env_*.jsonl,
-# not directly into records.pkl.

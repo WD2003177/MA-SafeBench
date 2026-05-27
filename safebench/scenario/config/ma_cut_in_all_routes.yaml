@@ -22,12 +22,13 @@ seed: 0
 ma_seed: 0
 initializer_seed: 0
 use_llm: true
-ma_use_message_pool: true
 ma_llm_model: null
 ma_llm_base_url: null
 ma_llm_timeout_s: 10
 ma_llm_temperature: 0.0
 ma_llm_max_retries: 1
+ma_llm_multi_agent: true
+ma_use_message_pool: true
 fallback_policy: 'rule'
 ma_decision_interval_s: 1.0
 ma_trace_enabled: true
@@ -46,6 +47,10 @@ planner:
   min_plan_horizon_s: 2.0
   lane_center_offset_m: 0.0
   spline_smoothing: true
+
+  contract:
+    duration_s: 8.0
+    duration_bounds_s: [2.0, 12.0]
 
   initializer:
     normal_speed_mps: 8.0
@@ -78,12 +83,46 @@ planner:
     hold_after_merge_s: 0.5
     post_brake_duration_s: 1.0
 
+  gain_lead:
+    duration_s: 3.0
+    speed_delta_mps: 2.0
+    min_speed_mps: 6.0
+
+  cut_in:
+    target_gap_m: 6.0
+    target_gap_bounds_m: [4.0, 15.0]
+    lane_change_duration_s: 2.8
+    lane_change_duration_bounds_s: [2.0, 5.0]
+    merge_s_offset_m: 10.0
+    merge_s_offset_bounds_m: [8.0, 25.0]
+    target_speed_mps: 9.0
+    brake_start_delay_s: 0.0
+    hold_after_merge_s: 0.5
+    post_brake_duration_s: 0.0
+
+  front_brake:
+    min_gap_m: 4.0
+    max_gap_m: 15.0
+    brake_decel_mps2: -3.5
+    brake_decel_bounds_mps2: [-5.0, -1.0]
+    brake_duration_s: 1.0
+    brake_duration_bounds_s: [0.5, 2.0]
+    min_speed_mps: 2.0
+
   block_ego_lane:
     target_gap_m: 15.0
     target_gap_bounds_m: [10.0, 30.0]
     speed_delta_mps: -1.0
     min_speed_mps: 3.0
     max_decel_mps2: -2.5
+    hold_duration_s: 5.0
+
+  seal_escape:
+    target_gap_m: 12.0
+    target_gap_bounds_m: [8.0, 25.0]
+    speed_delta_mps: -0.8
+    min_speed_mps: 3.0
+    max_decel_mps2: -2.0
     hold_duration_s: 5.0
 
   recover:

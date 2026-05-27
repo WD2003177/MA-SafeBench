@@ -4,8 +4,27 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 
-ALLOWED_BEHAVIORS = ("cut_in_and_brake", "block_ego_lane", "recover")
-ALLOWED_PHASES = ("observe", "compress", "strike", "recover")
+ALLOWED_TACTICS = ("gain_lead", "seal_escape", "cut_in", "front_brake", "recover")
+ALLOWED_BEHAVIORS = ALLOWED_TACTICS + ("cut_in_and_brake", "block_ego_lane")
+ALLOWED_PHASES = ("observe", "compress", "strike", "brake_pulse", "recover")
+ALLOWED_PASS_SIDES = ("left", "right")
+ALLOWED_BLOCKER_OBJECTIVES = ("seal_left", "seal_right", "seal_front")
+ALLOWED_STRIKER_OBJECTIVES = ("pass_left", "pass_right", "cut_in_front", "gain_lead")
+ALLOWED_ADVANCE_EVENTS = ("blocker_seal_success", "striker_cutin_window_ready", "cutin_success")
+ALLOWED_ABORT_EVENTS = ("realism_violation", "teleport_detected", "attacker_offroad", "hard_brake", "near_miss")
+ALLOWED_RENEGOTIATE_EVENTS = ("contract_timeout", "striker_window_lost", "blocker_seal_lost", "ego_lane_changed", "pass_side_blocked")
+ALLOWED_CONTRACT_EVENTS = ALLOWED_ADVANCE_EVENTS + ALLOWED_ABORT_EVENTS + ALLOWED_RENEGOTIATE_EVENTS
+PHASE_ALLOWED_TACTICS = {
+    "observe": tuple(),
+    "compress": ("gain_lead", "seal_escape"),
+    "strike": ("cut_in", "seal_escape"),
+    "brake_pulse": ("front_brake", "seal_escape"),
+    "recover": ("recover",),
+}
+LEGACY_BEHAVIOR_TO_TACTIC = {
+    "cut_in_and_brake": "cut_in",
+    "block_ego_lane": "seal_escape",
+}
 
 
 @dataclass
@@ -23,6 +42,7 @@ class BehaviorIR:
     actor_id: int
     role: str
     behavior: str
+    tactic: str
     target_actor: str
     target_actor_id: int
     start_time_s: float
@@ -32,6 +52,7 @@ class BehaviorIR:
     merge_s_offset_m: float
     expected_merge_gap_m: float
     params: Dict[str, float]
+    contract_id: str = ""
     constraints: DynamicsConstraints = field(default_factory=DynamicsConstraints)
     trigger: Dict[str, Any] = field(default_factory=dict)
     termination: Dict[str, Any] = field(default_factory=dict)
@@ -46,6 +67,7 @@ class PlannedBehavior:
     actor_name: str
     actor_id: int
     behavior: str
+    tactic: str
     start_time_s: float
     duration_s: float
     path_waypoints: List[Any]
@@ -85,3 +107,25 @@ class MAActorMeta:
     lane_id: int = 0
     is_junction: bool = False
     distance_to_next_junction_m: float = -1.0
+
+
+@dataclass
+class MAContract:
+    contract_id: str
+    phase: str
+    locked: bool
+    pass_side: str
+    blocker_actor: str
+    striker_actor: str
+    blocker_objective: str
+    striker_objective: str
+    target_gap_m: float
+    merge_s_offset_m: float
+    expire_time_s: float
+    advance_if: List[str] = field(default_factory=list)
+    abort_if: List[str] = field(default_factory=list)
+    renegotiate_if: List[str] = field(default_factory=list)
+    renegotiate_reason: str = ""
+
+    def active(self, sim_time_s: float) -> bool:
+        return self.locked and (self.expire_time_s <= 0.0 or sim_time_s <= self.expire_time_s)

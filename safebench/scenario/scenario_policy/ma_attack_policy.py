@@ -5,7 +5,6 @@ from typing import Any, Dict, List
 
 from safebench.scenario.scenario_policy.base_policy import BasePolicy
 from safebench.scenario.ma.ma_action_adapter import cache_ma_action, reset_ma_action_cache, to_safebench_action
-from safebench.scenario.ma.coordination import MAMessagePool, ma_agent_message_schema, ma_decision_schema
 from safebench.scenario.ma.llm_client import OpenAICompatibleClient
 
 
@@ -19,7 +18,6 @@ class MAAttackPolicy(BasePolicy):
         self.num_scenario = config["num_scenario"]
         self.use_llm = bool(config.get("use_llm", True))
         self.force_dummy_action = bool(config.get("ma_force_dummy_action", False))
-        self.use_message_pool = bool(config.get("ma_use_message_pool", True))
         self.decision_interval_s = float(config.get("ma_decision_interval_s", 1.0))
         self.latest_actions: Dict[int, Dict[str, Any]] = {}
         self.episode_id = 0
@@ -27,7 +25,7 @@ class MAAttackPolicy(BasePolicy):
         self.decision_counter: Dict[int, int] = {}
         self.last_decision_time: Dict[int, float] = {}
         self.last_decisions: Dict[int, Dict[str, Any]] = {}
-        self.message_pools: Dict[int, MAMessagePool] = {}
+        self.message_pools: Dict[int, List[Dict[str, Any]]] = {}
         self.llm = OpenAICompatibleClient(config)
         self.logger.log(">> Using MA online attack scenario policy", color="yellow")
 
@@ -58,8 +56,6 @@ class MAAttackPolicy(BasePolicy):
                 "planner": copy.deepcopy(self.config.get("planner", {})),
                 "ma_config": self._ma_config(),
             })
-            self.message_pools[env_id] = MAMessagePool()
-            self.message_pools[env_id].reset(self.episode_id)
         return init_actions, None
 
     def get_action(self, state, infos, deterministic=False):
@@ -90,6 +86,7 @@ class MAAttackPolicy(BasePolicy):
                 "decision_id": decision_id,
                 "decision_due": decision_due,
                 "phase": proposal.get("phase", "observe"),
+                "contract": proposal.get("contract"),
                 "commands": proposal.get("commands", []),
                 "raw_decision": proposal if decision_due else None,
             }
@@ -133,100 +130,110 @@ class MAAttackPolicy(BasePolicy):
                     "phase": previous.get("phase"),
                     "num_commands": len(previous.get("commands", [])) if isinstance(previous.get("commands", []), list) else 0,
                 }
-            if self.use_message_pool:
-                coordinated = self._decide_with_message_pool(summary, env_id, step, sim_time_s)
-                if isinstance(coordinated, dict) and "commands" in coordinated:
-                    return coordinated
-            llm_decision = self.llm.complete_json(summary, schema=ma_decision_schema(), schema_name="ma_decision")
+            self.llm.message_pool = list(self.message_pools.get(env_id, []))
+            llm_decision = self.llm.complete_json(summary)
+            self.message_pools[env_id] = list(self.llm.message_pool[-20:])
             if isinstance(llm_decision, dict) and "commands" in llm_decision:
+                if self.llm.last_trace:
+                    llm_decision["_ma_coordination_trace"] = copy.deepcopy(self.llm.last_trace)
                 return llm_decision
         return self._fallback_rule(info, step)
-
-    def _decide_with_message_pool(self, summary: Dict[str, Any], env_id: int, step: int, sim_time_s: float) -> Dict[str, Any]:
-        pool = self.message_pools.setdefault(env_id, MAMessagePool())
-        pool.begin_control_cycle(step, sim_time_s)
-        if pool.is_control_cycle_planned(step):
-            return self.last_decisions.get(env_id, {"phase": "observe", "commands": []})
-        pool.set_scenario_context({
-            "env_id": env_id,
-            "episode_id": self.episode_id,
-            "allowed_behaviors": summary.get("allowed_behaviors", []),
-            "parameter_bounds": summary.get("parameter_bounds", {}),
-            "risk_snapshot": summary.get("risk_snapshot", {}),
-        })
-        attackers = [item for item in summary.get("attackers", []) if isinstance(item, dict) and item.get("name")]
-        if not attackers:
-            return {"phase": "observe", "commands": [], "_ma_coordination_error": "no_attackers"}
-
-        for actor in attackers:
-            proposal_payload = self._agent_payload(summary, pool, actor, "proposer")
-            proposal = self.llm.complete_json(proposal_payload, schema=ma_agent_message_schema(), schema_name="ma_agent_proposal")
-            if isinstance(proposal, dict) and "sender" in proposal:
-                pool.publish(actor["name"], "proposal", proposal)
-
-        for actor in attackers:
-            critique_payload = self._agent_payload(summary, pool, actor, "critic")
-            critique = self.llm.complete_json(critique_payload, schema=ma_agent_message_schema(), schema_name="ma_agent_critique")
-            if isinstance(critique, dict) and "sender" in critique:
-                pool.publish(actor["name"], "critique", critique)
-
-        selector_payload = copy.deepcopy(summary)
-        selector_payload["_ma_prompt"] = (
-            "You are the MA selector. Use the shared message pool to choose a coordinated, physically feasible "
-            "multi-actor attack decision. Return only JSON with phase and commands. Commands may use "
-            "cut_in_and_brake, block_ego_lane, or recover. Do not output waypoints, throttle, steer, or brake."
-        )
-        selector_payload["shared_message_pool"] = pool.snapshot(viewer_id="selector")
-        selected = self.llm.complete_json(selector_payload, schema=ma_decision_schema(), schema_name="ma_selected_decision")
-        pool.mark_control_cycle_planned(step)
-        if isinstance(selected, dict) and "commands" in selected:
-            selected["_ma_coordination"] = pool.snapshot(viewer_id="selector")
-            return selected
-        return {"phase": "observe", "commands": [], "_ma_coordination": pool.snapshot(viewer_id="selector"), "_ma_coordination_error": "selector_failed"}
-
-    def _agent_payload(self, summary: Dict[str, Any], pool: MAMessagePool, actor: Dict[str, Any], role: str) -> Dict[str, Any]:
-        payload = copy.deepcopy(summary)
-        payload["_ma_prompt"] = (
-            "You are one MA LLM actor in a coordinated attack. Act as %s for viewer_actor. "
-            "Read shared_message_pool, publish your own role/intent/message, and optionally include one command. "
-            "Return only JSON matching the schema. Do not output waypoints, throttle, steer, or brake."
-        ) % role
-        payload["viewer_actor"] = actor
-        payload["coordination_role"] = role
-        payload["shared_message_pool"] = pool.snapshot(viewer_id=actor.get("name"))
-        return payload
 
     def _fallback_rule(self, info: Dict[str, Any], step: int) -> Dict[str, Any]:
         if step < 5:
             return {"phase": "observe", "commands": []}
         attackers = {}
         risk = {}
+        phase = "compress"
+        geometry = {}
         if isinstance(info, dict):
             summary = info.get("ma_scene_summary", {})
             if isinstance(summary, dict):
                 attackers = {item.get("name"): item for item in summary.get("attackers", []) if isinstance(item, dict)}
                 risk = summary.get("risk_snapshot", {}) if isinstance(summary.get("risk_snapshot", {}), dict) else {}
+                phase = summary.get("phase", phase)
+                geometry = summary.get("coordination_geometry", {}) if isinstance(summary.get("coordination_geometry", {}), dict) else {}
+        if risk.get("ma_event_hard_brake") or risk.get("ma_event_near_miss") or risk.get("ma_realism_violation_step"):
+            phase = "recover"
+        elif risk.get("ma_event_cutin_success"):
+            phase = "brake_pulse"
+        elif geometry.get("blocker_seal_success") and geometry.get("striker_cutin_window_ready"):
+            phase = "strike"
         striker_hints, blocker_hints = self._adaptive_hints(risk)
         commands = []
-        if "blocker_1" in attackers or not attackers:
+        if phase == "recover":
+            for actor_name, item in attackers.items():
+                commands.append({
+                    "actor_name": actor_name,
+                    "role": item.get("role_hint", "Recover"),
+                    "tactic": "recover",
+                    "target_actor": "none",
+                    "style": "safe_recover",
+                    "hints": {},
+                })
+            return {"phase": "recover", "commands": commands}
+        contract = self._fallback_contract(phase, attackers, striker_hints)
+        if phase in ("compress", "strike", "brake_pulse") and ("blocker_1" in attackers or not attackers):
             commands.append({
                 "actor_name": "blocker_1",
                 "role": "Blocker",
-                "behavior": "block_ego_lane",
+                "tactic": "seal_escape",
                 "target_actor": "ego",
                 "style": "space_compression",
                 "hints": blocker_hints,
             })
-        if "attacker_1" in attackers or not attackers:
+        if phase == "compress" and ("attacker_1" in attackers or not attackers):
             commands.append({
                 "actor_name": "attacker_1",
                 "role": "Striker",
-                "behavior": "cut_in_and_brake",
+                "tactic": "gain_lead",
+                "target_actor": "ego",
+                "style": "prepare_cut_in_window",
+                "hints": striker_hints,
+            })
+        elif phase == "strike" and ("attacker_1" in attackers or not attackers):
+            commands.append({
+                "actor_name": "attacker_1",
+                "role": "Striker",
+                "tactic": "cut_in",
                 "target_actor": "ego",
                 "style": "aggressive_but_feasible",
                 "hints": striker_hints,
             })
-        return {"phase": "strike", "commands": commands}
+        elif phase == "brake_pulse" and ("attacker_1" in attackers or not attackers):
+            commands.append({
+                "actor_name": "attacker_1",
+                "role": "Striker",
+                "tactic": "front_brake",
+                "target_actor": "ego",
+                "style": "short_brake_pulse",
+                "hints": striker_hints,
+            })
+        return {"phase": phase, "contract": contract, "commands": commands}
+
+    def _fallback_contract(self, phase: str, attackers: Dict[str, Any], striker_hints: Dict[str, float]) -> Dict[str, Any]:
+        striker = attackers.get("attacker_1", {}) if isinstance(attackers, dict) else {}
+        pass_side = striker.get("side") or striker.get("lateral_relation_to_ego") or "left"
+        if pass_side not in ("left", "right"):
+            pass_side = "left"
+        objective_by_phase = {
+            "compress": "gain_lead",
+            "strike": "cut_in_front",
+            "brake_pulse": "cut_in_front",
+        }
+        return {
+            "phase": phase,
+            "pass_side": pass_side,
+            "blocker_actor": "blocker_1",
+            "striker_actor": "attacker_1",
+            "blocker_objective": "seal_front",
+            "striker_objective": objective_by_phase.get(phase, "gain_lead"),
+            "target_gap_m": float(striker_hints.get("target_gap_m", 6.0)),
+            "merge_s_offset_m": float(striker_hints.get("merge_s_offset_m", 10.0)),
+            "advance_if": ["blocker_seal_success", "striker_cutin_window_ready"] if phase == "compress" else (["cutin_success"] if phase == "strike" else []),
+            "abort_if": ["realism_violation", "teleport_detected", "attacker_offroad", "hard_brake", "near_miss"],
+            "renegotiate_if": ["contract_timeout", "striker_window_lost", "blocker_seal_lost", "ego_lane_changed", "pass_side_blocked"],
+        }
 
     def _adaptive_hints(self, risk: Dict[str, Any]):
         striker_hints: Dict[str, float] = {}

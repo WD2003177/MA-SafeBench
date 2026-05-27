@@ -77,6 +77,7 @@ class AttackManager:
                 "command_id": plan.command_id,
                 "actor_name": plan.actor_name,
                 "behavior": plan.behavior,
+                "tactic": plan.tactic,
                 "planner_status": plan.planner_status,
                 "path_len": len(plan.path_waypoints),
                 "speed_profile": plan.speed_profile,
@@ -87,6 +88,20 @@ class AttackManager:
 
     def active_command_ids(self) -> List[str]:
         return [plan.command_id for plan in self.active.values()]
+
+    def behavior_progress(self, sim_time_s: float) -> Dict[str, Dict[str, Any]]:
+        progress = {}
+        for name, plan in self.active.items():
+            elapsed = max(0.0, sim_time_s - plan.start_time_s)
+            progress[name] = {
+                "command_id": plan.command_id,
+                "behavior": plan.behavior,
+                "tactic": plan.tactic,
+                "elapsed_s": elapsed,
+                "duration_s": plan.duration_s,
+                "progress": max(0.0, min(1.0, elapsed / max(plan.duration_s, 1e-3))),
+            }
+        return progress
 
     def tick(self, sim_time_s: float, dt: float) -> None:
         completed = []
@@ -107,7 +122,7 @@ class AttackManager:
                 continue
             target_transform = self._select_target_transform(actor, plan)
             target_speed_mps = plan.target_speed_mps(elapsed)
-            if plan.behavior == "recover":
+            if plan.tactic == "recover":
                 target_speed_mps = self._recover_target_speed(actor, target_speed_mps, dt)
             target_speed_kmh = target_speed_mps * 3.6
             control = controller.run_step(target_speed_kmh, target_transform)

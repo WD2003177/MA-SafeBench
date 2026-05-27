@@ -95,7 +95,7 @@ class MARiskMetrics:
                 step_offroad = True
             self._update_actor_realism(name, actor, wp, dt)
             if ego_wp is not None and wp is not None and wp.road_id == ego_wp.road_id and wp.lane_id == ego_wp.lane_id and 0.0 < rel_gap <= self.cutin_gap_m:
-                if active_behaviors.get(name) == "cut_in_and_brake":
+                if active_behaviors.get(name) in ("cut_in", "cut_in_and_brake"):
                     step_cutin_success = True
             loc = actor.get_transform().location
             prev = self.prev_actor_locations.get(name)
