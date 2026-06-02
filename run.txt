@@ -43,7 +43,7 @@ cd "$CARLA_ROOT"
 2. Terminal B: run MA-SafeBench, single route first
 --------------------------------------------------
 
-conda activate safebench
+conda activate ma-safebench
 
 export SAFE_ROOT=/home/ubuntu/wudi/ma-safebench
 export CARLA_ROOT=/home/ubuntu/wudi/carla_0.9.13
@@ -54,22 +54,11 @@ export PYTHONPATH="${SAFE_ROOT}:${CARLA_ROOT}/PythonAPI:${CARLA_ROOT}/PythonAPI/
 export MA_LLM_API_KEY="sk-b8da07d06a224a8f9ff1e72dff94fb06"
 export MA_LLM_MODEL="deepseek-chat"
 export MA_LLM_BASE_URL="https://api.deepseek.com"
-export MA_LLM_TIMEOUT_S=45
+export MA_LLM_TIMEOUT_S=60
 
 cd "$SAFE_ROOT"
 
-SDL_VIDEODRIVER=dummy python scripts/run.py \
-  --agent_cfg sac.yaml \
-  --scenario_cfg ma_cut_in.yaml \
-  --mode eval \
-  --num_scenario 1 \
-  --max_episode_step 300 \
-  --save_video \
-  --port 2402 \
-  --tm_port 8402 \
-  --fixed_delta_seconds 0.1 \
-  --exp_name ma_cut_in_s3_r0_llm \
-  --output_dir log
+SDL_VIDEODRIVER=dummy python scripts/run.py   --agent_cfg sac.yaml   --scenario_cfg ma_cut_in.yaml   --mode eval   --num_scenario 1   --max_episode_step 300   --save_video   --port 2430   --tm_port 8430   --fixed_delta_seconds 0.1   --device cpu   --exp_name ma_cut_in_test1   --output_dir log
 
 Notes:
 - ma_cut_in.yaml currently selects scenario_id: 3 and route_id: 0.

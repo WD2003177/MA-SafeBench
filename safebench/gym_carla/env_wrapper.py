@@ -12,6 +12,8 @@ import gym
 import numpy as np
 import pygame
 
+from safebench.scenario.scenario_manager.carla_data_provider import CarlaDataProvider
+
 
 class VectorWrapper():
     """ 
@@ -96,7 +98,7 @@ class VectorWrapper():
         
         # tick all scenarios
         for _ in range(self.frame_skip):
-            self.world.tick()
+            CarlaDataProvider.tick_world(self.world)
 
         # collect new observation of one frame
         obs_list = []
@@ -153,7 +155,7 @@ class VectorWrapper():
             self.env_list[e_i].clean_up()
 
         # tick to ensure that all destroy commands are executed
-        self.world.tick()
+        CarlaDataProvider.tick_world(self.world)
 
 
 class ObservationWrapper(gym.Wrapper):

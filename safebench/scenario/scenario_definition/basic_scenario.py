@@ -34,9 +34,9 @@ class BasicScenario(object):
 
         
         if CarlaDataProvider.is_sync_mode():
-            world.tick()
+            CarlaDataProvider.tick_world(world)
         else:
-            world.wait_for_tick()
+            CarlaDataProvider.wait_for_tick(world)
     
 
     def create_behavior(self, scenario_init_action):

@@ -51,9 +51,12 @@ class BehaviorIR:
     target_lane_ref: str
     merge_s_offset_m: float
     expected_merge_gap_m: float
-    params: Dict[str, float]
+    params: Dict[str, Any]
     contract_id: str = ""
     constraints: DynamicsConstraints = field(default_factory=DynamicsConstraints)
+    param_sources: Dict[str, str] = field(default_factory=dict)
+    soft_hint_repairs: List[Dict[str, Any]] = field(default_factory=list)
+    unreachable_reason: str = ""
     trigger: Dict[str, Any] = field(default_factory=dict)
     termination: Dict[str, Any] = field(default_factory=dict)
     fallback: Dict[str, Any] = field(default_factory=dict)
@@ -76,6 +79,7 @@ class PlannedBehavior:
     fallback: Dict[str, Any]
     planner_status: str = "planned"
     planner_notes: List[str] = field(default_factory=list)
+    resolved_physical_params: Dict[str, Any] = field(default_factory=dict)
 
     def target_speed_mps(self, elapsed_s: float) -> float:
         if not self.speed_profile:
@@ -122,6 +126,10 @@ class MAContract:
     target_gap_m: float
     merge_s_offset_m: float
     expire_time_s: float
+    gap_band: str = "normal"
+    merge_timing: str = "normal"
+    param_sources: Dict[str, str] = field(default_factory=dict)
+    soft_hint_repairs: List[Dict[str, Any]] = field(default_factory=list)
     advance_if: List[str] = field(default_factory=list)
     abort_if: List[str] = field(default_factory=list)
     renegotiate_if: List[str] = field(default_factory=list)

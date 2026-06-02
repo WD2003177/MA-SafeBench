@@ -238,7 +238,7 @@ class SAC(BasePolicy):
         if os.path.isfile(filepath):
             self.logger.log(f'>> Loading {self.name} model from {filepath}')
             with open(filepath, 'rb') as f:
-                checkpoint = torch.load(f)
+                checkpoint = torch.load(f, map_location=torch.device('cpu'))
             self.policy_net.load_state_dict(checkpoint['policy_net'])
             self.value_net.load_state_dict(checkpoint['value_net'])
             self.Q_net.load_state_dict(checkpoint['Q_net'])

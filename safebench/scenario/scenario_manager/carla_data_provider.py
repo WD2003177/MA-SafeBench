@@ -45,6 +45,7 @@ class CarlaDataProvider(object):
     _blueprint_library = None
     _ego_vehicle_route = None
     _traffic_manager_port = 8000
+    _carla_timeout_s = 60.0
     _random_seed = 2000
     _rng = random.RandomState(_random_seed)
 
@@ -163,6 +164,31 @@ class CarlaDataProvider(object):
             Get the CARLA client
         """
         return CarlaDataProvider._client
+
+    @staticmethod
+    def set_carla_timeout(timeout_s):
+        """
+            Set the timeout used by explicit world tick/wait_for_tick calls.
+        """
+        CarlaDataProvider._carla_timeout_s = float(timeout_s)
+
+    @staticmethod
+    def get_carla_timeout():
+        return CarlaDataProvider._carla_timeout_s
+
+    @staticmethod
+    def tick_world(world=None):
+        world = world or CarlaDataProvider._world
+        if world is None:
+            raise ValueError("class member 'world' not initialized yet")
+        return world.tick(CarlaDataProvider._carla_timeout_s)
+
+    @staticmethod
+    def wait_for_tick(world=None):
+        world = world or CarlaDataProvider._world
+        if world is None:
+            raise ValueError("class member 'world' not initialized yet")
+        return world.wait_for_tick(CarlaDataProvider._carla_timeout_s)
 
     @staticmethod
     def set_world(world):
@@ -485,7 +511,7 @@ class CarlaDataProvider(object):
         actors = []
 
         if CarlaDataProvider._client:
-            responses = CarlaDataProvider._client.apply_batch_sync(batch, sync_mode and tick)
+            responses = CarlaDataProvider._client.apply_batch_sync(batch, False)
         else:
             raise ValueError("class member \'client'\' not initialized yet")
 
@@ -493,9 +519,9 @@ class CarlaDataProvider(object):
         if not tick:
             pass
         elif sync_mode:
-            CarlaDataProvider._world.tick()
+            CarlaDataProvider.tick_world()
         else:
-            CarlaDataProvider._world.wait_for_tick()
+            CarlaDataProvider.wait_for_tick()
 
         actor_ids = [r.actor_id for r in responses if not r.error]
         for r in responses:
@@ -550,9 +576,9 @@ class CarlaDataProvider(object):
         if not tick:
             pass
         elif CarlaDataProvider.is_sync_mode():
-            CarlaDataProvider._world.tick()
+            CarlaDataProvider.tick_world()
         else:
-            CarlaDataProvider._world.wait_for_tick()
+            CarlaDataProvider.wait_for_tick()
 
         CarlaDataProvider._carla_actor_pool[actor.id] = actor
         CarlaDataProvider.register_actor(actor)

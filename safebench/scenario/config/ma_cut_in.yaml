@@ -5,7 +5,7 @@ policy_type: 'ma'
 
 route_dir: 'safebench/scenario/scenario_data/route'
 scenario_id: 3
-route_id: 0
+route_id: 7
 
 ego_action_dim: 2
 ego_state_dim: 4
@@ -30,10 +30,15 @@ ma_llm_max_retries: 1
 ma_llm_multi_agent: true
 ma_use_message_pool: true
 fallback_policy: 'rule'
-ma_decision_interval_s: 1.0
+carla_timeout_s: 60.0
+ma_fallback_on_llm_error: true
+ma_decision_interval_s: 0.5
 ma_trace_enabled: true
 ma_record_step_metrics: true
 ma_force_dummy_action: false
+ma_bootstrap_recover_enabled: false
+ma_repair_initial_observe_to_contract: true
+ma_hold_active_contract_without_llm: true
 ma_hard_brake_decel_mps2: -3.0
 ma_near_miss_ttc_s: 1.5
 ma_near_miss_distance_m: 3.0
@@ -41,19 +46,45 @@ ma_cutin_success_gap_m: 12.0
 
 planner:
   controller_dt: 0.1
+  pid_lateral_kp: 1.2
+  pid_lateral_ki: 0.02
+  pid_lateral_kd: 0.08
+  pid_longitudinal_kp: 0.35
+  pid_longitudinal_ki: 0.02
+  pid_longitudinal_kd: 0.0
+  pid_max_throttle: 0.35
+  pid_max_brake: 0.2
+  pid_max_steering: 0.5
+  realism_abort_grace_s: 1.0
   lookahead_distance_m: 6.0
   waypoint_spacing_m: 1.5
   max_plan_horizon_s: 6.0
   min_plan_horizon_s: 2.0
   lane_center_offset_m: 0.0
   spline_smoothing: true
+  min_runtime_lane_change_s: 2.2
+  max_runtime_lane_change_s: 5.0
+  max_attack_speed_mps: 12.0
+  merge_route_scan_distance_m: 60.0
 
   contract:
     duration_s: 8.0
     duration_bounds_s: [2.0, 12.0]
 
+  soft_hints:
+    default_gap_band: normal
+    default_merge_timing: normal
+    gap_band_targets_m:
+      tight: 5.5
+      normal: 8.0
+      loose: 12.0
+
   initializer:
+    anchor_source: ego
+    randomize_spawn_offsets: true
+    spawn_offset_sample_count: 8
     normal_speed_mps: 8.0
+    initial_speed_mps: 4.0
     avoid_junction: true
     min_junction_distance_m: 10.0
     junction_scan_distance_m: 80.0
@@ -62,9 +93,12 @@ planner:
     min_spawn_separation_m: 4.0
     max_lane_heading_diff_deg: 30.0
     side_candidates: ['left', 'right']
-    anchor_distances_m: [30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80]
-    striker_offsets_m: [-8, -4, 0, 4, 8]
-    blocker_offsets_m: [15, 20, 25, 30]
+    anchor_distances_m: [0, 5, 10, 15]
+    striker_lead_range_m: [14.0, 24.0]
+    blocker_lead_range_m: [18.0, 28.0]
+    striker_lead_offsets_m: [14, 16, 18, 20, 22, 24]
+    blocker_lead_offsets_m: [18, 20, 22, 25, 28]
+    striker_prepare_window_m: [12.0, 35.0]
     actor_models:
       attacker_1: 'vehicle.audi.tt'
       blocker_1: 'vehicle.nissan.patrol'
@@ -87,6 +121,7 @@ planner:
     duration_s: 3.0
     speed_delta_mps: 2.0
     min_speed_mps: 6.0
+    max_speed_mps: 11.0
 
   cut_in:
     target_gap_m: 6.0
@@ -96,6 +131,8 @@ planner:
     merge_s_offset_m: 10.0
     merge_s_offset_bounds_m: [8.0, 25.0]
     target_speed_mps: 9.0
+    min_route_remaining_m: 20.0
+    max_lane_change_duration_s: 5.0
     brake_start_delay_s: 0.0
     hold_after_merge_s: 0.5
     post_brake_duration_s: 0.0
@@ -103,6 +140,9 @@ planner:
   front_brake:
     min_gap_m: 4.0
     max_gap_m: 15.0
+    max_negative_relative_speed_mps: 3.0
+    max_ttc_s: 6.0
+    max_heading_error_deg: 20.0
     brake_decel_mps2: -3.5
     brake_decel_bounds_mps2: [-5.0, -1.0]
     brake_duration_s: 1.0
@@ -118,16 +158,20 @@ planner:
     hold_duration_s: 5.0
 
   seal_escape:
-    target_gap_m: 12.0
-    target_gap_bounds_m: [8.0, 25.0]
+    target_gap_m: 16.0
+    target_gap_bounds_m: [8.0, 35.0]
+    front_window_min_m: 8.0
+    front_window_max_m: 35.0
     speed_delta_mps: -0.8
-    min_speed_mps: 3.0
+    min_speed_mps: 5.0
+    max_speed_mps: 10.5
     max_decel_mps2: -2.0
     hold_duration_s: 5.0
 
   recover:
     normal_speed_mps: 8.0
-    duration_s: 3.0
+    duration_s: 5.0
+    max_recover_accel_mps2: 0.8
     max_decel_mps2: -2.0
     front_gap_slowdown_m: 10.0
     min_front_gap_m: 5.0

@@ -31,6 +31,7 @@ from safebench.gym_carla.envs.misc import (
 from safebench.scenario.scenario_definition.route_scenario import RouteScenario
 from safebench.scenario.scenario_definition.perception_scenario import PerceptionScenario
 from safebench.scenario.scenario_definition.scenic_scenario import ScenicScenario
+from safebench.scenario.scenario_manager.carla_data_provider import CarlaDataProvider
 from safebench.scenario.scenario_manager.scenario_manager import ScenarioManager
 from safebench.scenario.tools.route_manipulation import interpolate_trajectory
 
@@ -250,7 +251,7 @@ class CarlaEnv(gym.Env):
         self.world.apply_settings(self.settings)
 
         for _ in range(self.warm_up_steps):
-            self.world.tick()
+            CarlaDataProvider.tick_world(self.world)
         return self._get_obs(), self._get_info()
 
     def _attach_sensor(self):

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+import random
 from typing import Any, Dict, List, Optional, Tuple
 
 import carla
@@ -34,14 +36,21 @@ class MAScenarioInitializer:
         self.config = config
         self.route = route or []
         self.actor_models = config.get("actor_models", {"attacker_1": "vehicle.audi.tt", "blocker_1": "vehicle.nissan.patrol"})
+        self.rng = random.Random(int(config.get("seed", 0)))
 
     def spawn(self) -> Tuple[Dict[str, Any], Dict[str, MAActorMeta], Dict[str, Any]]:
         actors: Dict[str, Any] = {}
         metadata: Dict[str, MAActorMeta] = {}
         init_meta: Dict[str, Any] = {"spawn_retry_count": 0, "selected_side": "unknown", "failure_reason": None}
         side_candidates = self.config.get("side_candidates", ["left", "right"])
-        striker_offsets = self.config.get("striker_offsets_m", [-8, -4, 0, 4, 8])
-        blocker_offsets = self.config.get("blocker_offsets_m", [15, 20, 25, 30])
+        striker_offsets = self._sample_offsets(
+            self.config.get("striker_lead_range_m", [16.0, 30.0]),
+            self.config.get("striker_lead_offsets_m", self.config.get("striker_offsets_m", [16, 20, 24, 28, 30])),
+        )
+        blocker_offsets = self._sample_offsets(
+            self.config.get("blocker_lead_range_m", [20.0, 35.0]),
+            self.config.get("blocker_lead_offsets_m", self.config.get("blocker_offsets_m", [20, 25, 30, 35])),
+        )
         for route_index, distance, anchor in self._anchor_candidates():
             junction_distance = self._distance_to_next_junction(anchor)
             if anchor.is_junction and self.config.get("avoid_junction", True):
@@ -69,6 +78,7 @@ class MAScenarioInitializer:
                         self._destroy(striker)
                         init_meta["failure_reason"] = "striker_spawn_failed"
                         continue
+                    self._set_initial_velocity(striker, striker_wp)
                     for blocker_offset in blocker_offsets:
                         blocker_wp = _advance(anchor, blocker_offset)
                         blocker = self._try_spawn("blocker_1", blocker_wp.transform)
@@ -77,10 +87,12 @@ class MAScenarioInitializer:
                             self._destroy(blocker)
                             init_meta["failure_reason"] = "blocker_spawn_failed"
                             continue
+                        self._set_initial_velocity(blocker, blocker_wp)
                         actors["attacker_1"] = striker
                         actors["blocker_1"] = blocker
                         init_meta.update({
                             "selected_side": side,
+                            "failure_reason": None,
                             "attack_anchor": {
                                 "road_id": anchor.road_id,
                                 "lane_id": anchor.lane_id,
@@ -88,6 +100,10 @@ class MAScenarioInitializer:
                                 "route_heading_deg": anchor.transform.rotation.yaw,
                                 "selected_side": side,
                                 "anchor_distance_m": distance,
+                                "striker_lead_offset_m": striker_offset,
+                                "blocker_lead_offset_m": blocker_offset,
+                                "anchor_source": self.config.get("anchor_source", "ego"),
+                                "offset_sampling": "seeded_range" if self.config.get("randomize_spawn_offsets", True) else "configured_offsets",
                                 "route_index": route_index,
                                 "junction_distance_m": junction_distance,
                             },
@@ -99,19 +115,55 @@ class MAScenarioInitializer:
         return actors, metadata, init_meta
 
     def _anchor_candidates(self):
-        anchor_distances = self.config.get("anchor_distances_m", list(range(30, 85, 5)))
+        anchor_distances = self.config.get("anchor_distances_m", [0, 5, 10, 15])
         route_transforms = self._route_transforms()
+        anchor_source = str(self.config.get("anchor_source", "ego") or "ego").lower()
+        anchor_location = None
+        if anchor_source == "ego" and self.ego_vehicle is not None and self.ego_vehicle.is_alive:
+            anchor_location = self.ego_vehicle.get_transform().location
+            ego_wp = CarlaDataProvider.get_map().get_waypoint(anchor_location, project_to_road=True, lane_type=carla.LaneType.Driving)
+            if not route_transforms and ego_wp is not None:
+                for distance in anchor_distances:
+                    yield -1, distance, _advance(ego_wp, distance)
+                return
+        if anchor_location is None:
+            anchor_location = self.reference_waypoint.transform.location
         if not route_transforms:
             for distance in anchor_distances:
                 yield -1, distance, _advance(self.reference_waypoint, distance)
             return
-        ref_index = self._nearest_route_index(self.reference_waypoint.transform.location, route_transforms)
+        ref_index = self._nearest_route_index(anchor_location, route_transforms)
         for distance in anchor_distances:
             idx = self._route_index_at_distance(route_transforms, ref_index, float(distance))
             transform = route_transforms[idx]
             waypoint = CarlaDataProvider.get_map().get_waypoint(transform.location, project_to_road=True, lane_type=carla.LaneType.Driving)
             if waypoint is not None:
                 yield idx, distance, waypoint
+
+    def _sample_offsets(self, range_value: Any, fallback_offsets: Any) -> List[float]:
+        if not self.config.get("randomize_spawn_offsets", True):
+            return [float(value) for value in fallback_offsets]
+        count = int(self.config.get("spawn_offset_sample_count", 8))
+        try:
+            lo = float(range_value[0])
+            hi = float(range_value[1])
+        except Exception:
+            values = [float(value) for value in fallback_offsets]
+            self.rng.shuffle(values)
+            return values
+        if hi < lo:
+            lo, hi = hi, lo
+        values = [self.rng.uniform(lo, hi) for _ in range(max(1, count))]
+        values.extend(float(value) for value in fallback_offsets)
+        deduped = []
+        seen = set()
+        for value in values:
+            rounded = round(float(value), 2)
+            if rounded in seen:
+                continue
+            seen.add(rounded)
+            deduped.append(rounded)
+        return deduped
 
     def _route_transforms(self) -> List[Any]:
         transforms = []
@@ -132,6 +184,8 @@ class MAScenarioInitializer:
         return best_idx
 
     def _route_index_at_distance(self, route_transforms: List[Any], start_idx: int, distance_m: float) -> int:
+        if distance_m <= 0.0:
+            return start_idx
         traveled = 0.0
         prev = route_transforms[start_idx].location
         for idx in range(start_idx + 1, len(route_transforms)):
@@ -191,6 +245,14 @@ class MAScenarioInitializer:
             return actor
         except RuntimeError:
             return None
+
+    def _set_initial_velocity(self, actor, waypoint) -> None:
+        try:
+            speed = float(self.config.get("initial_speed_mps", self.config.get("normal_speed_mps", 8.0)))
+            yaw = math.radians(float(waypoint.transform.rotation.yaw))
+            actor.set_target_velocity(carla.Vector3D(speed * math.cos(yaw), speed * math.sin(yaw), 0.0))
+        except Exception:
+            return
 
     def _destroy(self, actor) -> None:
         if actor is not None and CarlaDataProvider.actor_id_exists(actor.id):

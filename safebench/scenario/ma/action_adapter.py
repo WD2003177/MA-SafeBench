@@ -48,10 +48,13 @@ def resolve_ma_action(
         return None
 
     action_step = action.get("step")
-    if action_step is not None and step - int(action_step) > max_step_lag:
+    step_lag = None
+    if action_step is not None:
+        step_lag = step - int(action_step)
+    if step_lag is not None and step_lag > max_step_lag:
         return None
 
     action_time = action.get("sim_time_s")
-    if action_time is not None and sim_time_s - float(action_time) > max_time_lag_s:
+    if action_time is not None and (step_lag is None or step_lag > 0) and sim_time_s - float(action_time) > max_time_lag_s:
         return None
     return action

@@ -58,6 +58,8 @@ class MultiAgentCutInLeadingVehicle(BasicScenario):
         self.last_behavior_summary = {}
         self.init_failed = False
         self.init_failure_reason = None
+        self.initial_attack_window = {}
+        self.initial_attack_window_lost_traced = False
         self.step_record = {}
 
     def create_behavior(self, scenario_init_action):
@@ -81,6 +83,8 @@ class MultiAgentCutInLeadingVehicle(BasicScenario):
         self.last_rejected = []
         self.init_failed = False
         self.init_failure_reason = None
+        self.initial_attack_window = {}
+        self.initial_attack_window_lost_traced = False
         self.step_record = {}
         reset_ma_action_cache(self.env_id)
 
@@ -104,6 +108,14 @@ class MultiAgentCutInLeadingVehicle(BasicScenario):
                 "ma_verifier_status_code": "init_failed",
             }
         self._trace({"event": "scenario_initialized", "env_id": self.env_id, "data_id": self.data_id, "metadata": self._metadata_dict(), "init_metadata": self.init_metadata, "init_failed": self.init_failed, "init_failure_reason": self.init_failure_reason})
+        if not self.init_failed:
+            sim_time_s, _ = self._timebase()
+            self.initial_attack_window = self._attack_window_status()
+            self._trace({"event": "initial_attack_window", "sim_time_s": sim_time_s, **self.initial_attack_window})
+            if bool(self.ma_config.get("bootstrap_recover_enabled", False)):
+                self._bootstrap_recover_actors(sim_time_s)
+            else:
+                self._trace({"event": "bootstrap_recover_skipped", "reason": "disabled_to_preserve_initial_attack_window", "sim_time_s": sim_time_s})
 
     def update_behavior(self, scenario_action):
         sim_time_s, dt = self._timebase()
@@ -122,14 +134,26 @@ class MultiAgentCutInLeadingVehicle(BasicScenario):
             max_step_lag=3,
             max_time_lag_s=max(2.5, float(self.ma_config.get("decision_interval_s", 1.0)) * 3.0),
         )
+        if action is None:
+            self._trace({
+                "event": "ma_action_missing",
+                "tick": self.tick_count,
+                "sim_time_s": sim_time_s,
+                "env_id": self.env_id,
+                "episode_id": int(self.init_action.get("episode_id", 0)),
+                "scenario_action_type": type(scenario_action).__name__,
+                "scenario_action_repr": repr(scenario_action)[:500],
+            })
         if action is not None and action.get("decision_due", True) and int(action.get("decision_id", -1)) != self.last_decision_id:
             self.last_action_step = int(action.get("step", self.last_action_step + 1))
             self.last_decision_id = int(action.get("decision_id", self.last_decision_id))
+            self._trace({"event": "ma_action_received", "tick": self.tick_count, "sim_time_s": sim_time_s, "action": action})
             self._handle_action(action, sim_time_s)
         elif action is None and self._has_active_attack():
             max_lag = max(3, int(float(self.ma_config.get("decision_interval_s", 1.0)) / max(dt, 1e-3)) * 3)
             if self.last_action_step >= 0 and self.tick_count - self.last_action_step > max_lag:
                 self._request_recover("stale_ma_action", sim_time_s)
+        self._trace_initial_window_loss(sim_time_s)
         if self.attack_manager is not None:
             self.attack_manager.tick(sim_time_s, dt)
         if self.metrics is not None:
@@ -174,7 +198,7 @@ class MultiAgentCutInLeadingVehicle(BasicScenario):
                 self.attack_manager.set_planned_behavior(plan)
                 self.last_behavior_summary[ir.actor_name] = {"command_id": ir.command_id, "phase": action.get("phase"), "behavior": ir.behavior, "tactic": ir.tactic}
                 risk_snapshot = self.metrics.risk_snapshot() if self.metrics else {}
-                self._trace({"event": "decision", "decision_id": self.decision_id, "raw": action.get("raw_decision", action), "contract": self.active_contract, "contract_event": contract_event, "behavior_ir": ir, "planned_behavior": {"command_id": plan.command_id, "behavior": plan.behavior, "tactic": plan.tactic, "path_len": len(plan.path_waypoints), "speed_profile": plan.speed_profile, "planner_status": plan.planner_status, "planner_notes": plan.planner_notes}, "risk_snapshot": risk_snapshot, "rejected": rejected})
+                self._trace({"event": "decision", "decision_id": self.decision_id, "raw": action.get("raw_decision", action), "contract": self.active_contract, "contract_event": contract_event, "behavior_ir": ir, "planned_behavior": {"command_id": plan.command_id, "behavior": plan.behavior, "tactic": plan.tactic, "path_len": len(plan.path_waypoints), "speed_profile": plan.speed_profile, "planner_status": plan.planner_status, "planner_notes": plan.planner_notes, "resolved_physical_params": plan.resolved_physical_params}, "risk_snapshot": risk_snapshot, "realism_violation_reasons": self.metrics.realism_violation_reasons() if self.metrics else [], "rejected": rejected})
             except Exception as exc:
                 self.last_verifier_status = "planner_failed"
                 self._trace({"event": "planner_failed", "decision_id": self.decision_id, "command": ir.command_id, "error": str(exc)})
@@ -214,6 +238,7 @@ class MultiAgentCutInLeadingVehicle(BasicScenario):
             self.contract_failure_reason = ""
             if self.active_contract is not None:
                 self.current_phase = self.active_contract.phase
+                self._refresh_contract_lifecycle()
         elif event_name == "contract_released":
             self.contract_status = "released"
             self.contract_failure_reason = event.get("reason", "") if isinstance(event, dict) else ""
@@ -258,7 +283,69 @@ class MultiAgentCutInLeadingVehicle(BasicScenario):
                 self.attack_manager.set_planned_behavior(plan)
             except Exception as exc:
                 rejected.append({"status": "rejected", "reason": "recover_planner_failed", "actor_name": ir.actor_name, "error": str(exc)})
-        self._trace({"event": "recover_requested", "reason": reason, "compiled": compiled, "rejected": rejected})
+        self._trace({"event": "recover_requested", "reason": reason, "compiled": compiled, "rejected": rejected, "realism_violation_reasons": self.metrics.realism_violation_reasons() if self.metrics else []})
+
+    def _bootstrap_recover_actors(self, sim_time_s: float) -> None:
+        if self.attack_manager is None or self.compiler is None or self.planner is None:
+            return
+        compiled, rejected = self._compile_recover_all(sim_time_s)
+        for ir in compiled:
+            actor = self.actors_by_name.get(ir.actor_name)
+            try:
+                plan = self.planner.plan(ir, actor, self.ego_vehicle, self.actors_by_name)
+                self.attack_manager.set_planned_behavior(plan)
+            except Exception as exc:
+                rejected.append({"status": "rejected", "reason": "bootstrap_recover_planner_failed", "actor_name": ir.actor_name, "error": str(exc)})
+        self._trace({"event": "bootstrap_recover", "compiled": compiled, "rejected": rejected})
+
+    def _attack_window_status(self) -> Dict[str, Any]:
+        summary = self.get_ma_scene_summary()
+        geometry = summary.get("coordination_geometry", {}) if isinstance(summary, dict) else {}
+        attackers = summary.get("attackers", []) if isinstance(summary, dict) else []
+        compact = []
+        for item in attackers:
+            compact.append({
+                "name": item.get("name"),
+                "role_hint": item.get("role_hint"),
+                "side": item.get("side"),
+                "longitudinal_gap_to_ego_m": item.get("longitudinal_gap_to_ego_m"),
+                "longitudinal_relation_to_ego": item.get("longitudinal_relation_to_ego"),
+                "lateral_relation_to_ego": item.get("lateral_relation_to_ego"),
+                "striker_in_prepare_window": item.get("striker_in_prepare_window"),
+                "blocker_in_front_window": item.get("blocker_in_front_window"),
+            })
+        valid = bool(geometry.get("initial_attack_window_valid"))
+        return {
+            "valid": valid,
+            "geometry": {
+                "initial_attack_window_valid": valid,
+                "blocker_front_window_ready": bool(geometry.get("blocker_front_window_ready")),
+                "striker_prepare_window_ready": bool(geometry.get("striker_prepare_window_ready")),
+                "blocker_front_window_m": geometry.get("blocker_front_window_m"),
+                "striker_prepare_window_m": geometry.get("striker_prepare_window_m"),
+            },
+            "attackers": compact,
+        }
+
+    def _trace_initial_window_loss(self, sim_time_s: float) -> None:
+        if self.initial_attack_window_lost_traced:
+            return
+        if not self.initial_attack_window.get("valid"):
+            return
+        if self.active_contract is not None or self._has_active_attack():
+            return
+        current = self._attack_window_status()
+        if current.get("valid"):
+            return
+        self.initial_attack_window_lost_traced = True
+        self._trace({
+            "event": "initial_attack_window_lost",
+            "diagnostic": "bootstrap_moved_out_of_window" if bool(self.ma_config.get("bootstrap_recover_enabled", False)) else "initial_window_lost_before_contract",
+            "bootstrap_moved_out_of_window": bool(self.ma_config.get("bootstrap_recover_enabled", False)),
+            "sim_time_s": sim_time_s,
+            "initial": self.initial_attack_window,
+            "current": current,
+        })
 
     def _advance_phase(self, record: Dict[str, Any]) -> None:
         events = self._contract_events(record)
@@ -271,6 +358,12 @@ class MultiAgentCutInLeadingVehicle(BasicScenario):
         if not self.active_contract.active(self.last_sim_time_s):
             events.add("contract_timeout")
 
+        grace_s = float(self.planner_config.get("realism_abort_grace_s", 1.0))
+        active_elapsed_s = self.attack_manager.min_active_elapsed_s(self.last_sim_time_s) if self.attack_manager else float("inf")
+        if "realism_violation" in events and active_elapsed_s < grace_s:
+            events.discard("realism_violation")
+            self._trace({"event": "realism_abort_deferred", "contract": self.active_contract, "active_elapsed_s": active_elapsed_s, "grace_s": grace_s})
+
         abort_events = [event for event in self.active_contract.abort_if if event in events]
         if abort_events:
             self.current_phase = "recover"
@@ -278,7 +371,7 @@ class MultiAgentCutInLeadingVehicle(BasicScenario):
             self.active_contract.renegotiate_reason = abort_events[0]
             self.contract_status = "released"
             self.contract_failure_reason = abort_events[0]
-            self._trace({"event": "contract_aborted", "contract": self.active_contract, "matched_events": abort_events, "current_events": sorted(events)})
+            self._trace({"event": "contract_aborted", "contract": self.active_contract, "matched_events": abort_events, "current_events": sorted(events), "realism_violation_reasons": self.metrics.realism_violation_reasons() if self.metrics else []})
             if self._has_active_attack():
                 self._request_recover("contract_abort_" + abort_events[0], self.last_sim_time_s)
             return
@@ -300,10 +393,31 @@ class MultiAgentCutInLeadingVehicle(BasicScenario):
             old_phase = self.current_phase
             self.current_phase = self._next_contract_phase(self.current_phase)
             self.active_contract.phase = self.current_phase
+            self._refresh_contract_lifecycle()
             self._trace({"event": "contract_phase_advanced", "contract": self.active_contract, "from_phase": old_phase, "to_phase": self.current_phase, "matched_events": advance_events, "current_events": sorted(events)})
             return
 
         self.active_contract.phase = self.current_phase
+        self._refresh_contract_lifecycle()
+
+    def _refresh_contract_lifecycle(self) -> None:
+        if self.active_contract is None:
+            return
+        self.active_contract.advance_if = self._advance_events_for_phase(self.current_phase)
+        self.active_contract.abort_if = self._abort_events_for_phase(self.current_phase)
+
+    def _advance_events_for_phase(self, phase: str) -> List[str]:
+        if phase == "compress":
+            return ["blocker_seal_success", "striker_cutin_window_ready"]
+        if phase == "strike":
+            return ["cutin_success"]
+        return []
+
+    def _abort_events_for_phase(self, phase: str) -> List[str]:
+        base = ["realism_violation", "teleport_detected", "attacker_offroad"]
+        if phase == "brake_pulse":
+            return base + ["hard_brake", "near_miss"]
+        return base
 
     def _contract_events(self, record: Dict[str, Any]) -> set:
         events = set()
@@ -371,11 +485,16 @@ class MultiAgentCutInLeadingVehicle(BasicScenario):
             "target_gap_m": cut_in_cfg.get("target_gap_bounds_m", [4.0, 15.0]),
             "lane_change_duration_s": cut_in_cfg.get("lane_change_duration_bounds_s", [2.0, 5.0]),
             "brake_decel_mps2": self.planner_config.get("front_brake", {}).get("brake_decel_bounds_mps2", [-5.0, -1.0]),
+            "blocker_front_window_m": [
+                self.planner_config.get("seal_escape", {}).get("front_window_min_m", 8.0),
+                self.planner_config.get("seal_escape", {}).get("front_window_max_m", 35.0),
+            ],
+            "striker_prepare_window_m": self.planner_config.get("initializer", {}).get("striker_prepare_window_m", [12.0, 35.0]),
         }
         active = self.attack_manager.active_behaviors() if self.attack_manager else {}
         progress = self.attack_manager.behavior_progress(self.last_sim_time_s) if self.attack_manager else {}
         risk = self.metrics.risk_snapshot() if self.metrics else {}
-        return build_scene_summary(
+        summary = build_scene_summary(
             self.ego_vehicle,
             self.actors_by_name,
             self.actor_metadata,
@@ -389,6 +508,10 @@ class MultiAgentCutInLeadingVehicle(BasicScenario):
             contract_status=self.contract_status,
             contract_failure_reason=self.contract_failure_reason,
         )
+        summary["sim_time_s"] = self.last_sim_time_s
+        summary["dt"] = self.last_dt
+        summary["realism_violation_reasons"] = self.metrics.realism_violation_reasons() if self.metrics else []
+        return summary
 
     def _timebase(self):
         try:

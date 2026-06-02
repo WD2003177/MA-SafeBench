@@ -61,6 +61,7 @@ class MARiskMetrics:
         self.episode_near_miss = False
         self.episode_realism_valid_attack = False
         self.step_record = {}
+        self.last_realism_violation_reasons = []
 
     def update(self, ego_vehicle, actors: Dict[str, Any], active_behaviors: Dict[str, str], sim_time_s: float, dt: float) -> Dict[str, Any]:
         dt = max(float(dt), 1e-3)
@@ -77,6 +78,7 @@ class MARiskMetrics:
         step_cutin_success = False
         max_jump = 0.0
         self._step_realism_violation = False
+        self.last_realism_violation_reasons = []
         carla_map = CarlaDataProvider.get_map()
         ego_wp = carla_map.get_waypoint(ego_vehicle.get_transform().location, project_to_road=True, lane_type=carla.LaneType.Driving)
 
@@ -93,6 +95,7 @@ class MARiskMetrics:
             wp = carla_map.get_waypoint(actor.get_transform().location, project_to_road=True, lane_type=carla.LaneType.Driving)
             if strict_wp is None:
                 step_offroad = True
+                self._add_realism_reason(name, "offroad", 1.0, 0.0)
             self._update_actor_realism(name, actor, wp, dt)
             if ego_wp is not None and wp is not None and wp.road_id == ego_wp.road_id and wp.lane_id == ego_wp.lane_id and 0.0 < rel_gap <= self.cutin_gap_m:
                 if active_behaviors.get(name) in ("cut_in", "cut_in_and_brake"):
@@ -105,6 +108,7 @@ class MARiskMetrics:
                 margin = _speed(actor) * dt + 3.0
                 if jump > margin:
                     step_teleport = True
+                    self._add_realism_reason(name, "teleport", jump, margin)
             self.prev_actor_locations[name] = carla.Location(loc.x, loc.y, loc.z)
 
         if step_min_distance == float("inf"):
@@ -165,16 +169,38 @@ class MARiskMetrics:
             self.episode_attacker_max_abs_accel = max(self.episode_attacker_max_abs_accel, abs(lon_accel))
             self.episode_attacker_max_abs_jerk = max(self.episode_attacker_max_abs_jerk, abs(jerk))
             self.episode_attacker_max_lateral_accel = max(self.episode_attacker_max_lateral_accel, abs(lat_accel))
-            violation = abs(lon_accel) > self.max_abs_accel or abs(jerk) > self.max_abs_jerk or abs(lat_accel) > self.max_lateral_accel
+            violation = False
+            if abs(lon_accel) > self.max_abs_accel:
+                violation = True
+                self._add_realism_reason(name, "longitudinal_accel", abs(lon_accel), self.max_abs_accel)
+            if abs(jerk) > self.max_abs_jerk:
+                violation = True
+                self._add_realism_reason(name, "jerk", abs(jerk), self.max_abs_jerk)
+            if abs(lat_accel) > self.max_lateral_accel:
+                violation = True
+                self._add_realism_reason(name, "lateral_accel", abs(lat_accel), self.max_lateral_accel)
             if waypoint is not None:
                 heading_error = abs((transform.rotation.yaw - waypoint.transform.rotation.yaw + 180.0) % 360.0 - 180.0)
                 lane_center_distance = transform.location.distance(waypoint.transform.location)
-                violation = violation or heading_error > self.max_heading_error_deg
-                violation = violation or lane_center_distance > waypoint.lane_width * 0.75
+                if heading_error > self.max_heading_error_deg:
+                    violation = True
+                    self._add_realism_reason(name, "heading_error", heading_error, self.max_heading_error_deg)
+                lane_limit = waypoint.lane_width * 0.75
+                if lane_center_distance > lane_limit:
+                    violation = True
+                    self._add_realism_reason(name, "lane_center_deviation", lane_center_distance, lane_limit)
             self._step_realism_violation = self._step_realism_violation or violation
             return violation
         except Exception:
             return False
+
+    def _add_realism_reason(self, actor_name: str, reason: str, measured: float, limit: float) -> None:
+        self.last_realism_violation_reasons.append({
+            "actor": actor_name,
+            "reason": reason,
+            "measured": float(measured),
+            "limit": float(limit),
+        })
 
     def aggregate_record(self) -> Dict[str, Any]:
         return {
@@ -198,3 +224,6 @@ class MARiskMetrics:
 
     def risk_snapshot(self) -> Dict[str, Any]:
         return dict(self.step_record) if self.step_record else self.aggregate_record()
+
+    def realism_violation_reasons(self):
+        return list(self.last_realism_violation_reasons)

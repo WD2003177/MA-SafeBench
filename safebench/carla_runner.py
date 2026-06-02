@@ -52,7 +52,8 @@ class CarlaRunner:
 
         # apply settings to carla
         self.client = carla.Client('localhost', scenario_config['port'])
-        self.client.set_timeout(10.0)
+        self.client_timeout_s = float(scenario_config.get('carla_timeout_s', 60.0))
+        self.client.set_timeout(self.client_timeout_s)
         self.world = None
         self.env = None
 
@@ -139,12 +140,18 @@ class CarlaRunner:
 
     def _init_world(self, town):
         self.logger.log(f">> Initializing carla world: {town}")
+        self.logger.log(f">> CARLA client timeout: {self.client_timeout_s:.1f}s")
         self.world = self.client.load_world(town)
         settings = self.world.get_settings()
         settings.synchronous_mode = True
         settings.fixed_delta_seconds = self.fixed_delta_seconds
         self.world.apply_settings(settings)
+        self.traffic_manager = self.client.get_trafficmanager(self.scenario_config['tm_port'])
+        self.traffic_manager.set_synchronous_mode(True)
+        self.traffic_manager.set_random_device_seed(self.seed)
+        self.traffic_manager.set_hybrid_physics_mode(False)
         CarlaDataProvider.set_client(self.client)
+        CarlaDataProvider.set_carla_timeout(self.client_timeout_s)
         CarlaDataProvider.set_world(self.world)
         CarlaDataProvider.set_traffic_manager_port(self.scenario_config['tm_port'])
         self.world.set_weather(carla.WeatherParameters.ClearNoon)

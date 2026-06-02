@@ -54,23 +54,43 @@ class AttackManager:
         self.active: Dict[str, PlannedBehavior] = {}
         self.path_progress: Dict[str, int] = {}
         self.failure_reasons: Dict[str, str] = {}
+        self.last_plan_start_s: Dict[str, float] = {}
         self.reset()
 
     def reset(self) -> None:
         self.active = {}
         self.path_progress = {}
         self.failure_reasons = {}
+        self.last_plan_start_s = {}
         self.controllers = {}
         dt = float(self.config.get("controller_dt", 0.1))
-        args_lat = {"K_P": 1.95, "K_I": 0.05, "K_D": 0.2, "dt": dt}
-        args_lon = {"K_P": 1.0, "K_I": 0.05, "K_D": 0.0, "dt": dt}
+        args_lat = {
+            "K_P": float(self.config.get("pid_lateral_kp", 1.2)),
+            "K_I": float(self.config.get("pid_lateral_ki", 0.02)),
+            "K_D": float(self.config.get("pid_lateral_kd", 0.08)),
+            "dt": dt,
+        }
+        args_lon = {
+            "K_P": float(self.config.get("pid_longitudinal_kp", 0.35)),
+            "K_I": float(self.config.get("pid_longitudinal_ki", 0.02)),
+            "K_D": float(self.config.get("pid_longitudinal_kd", 0.0)),
+            "dt": dt,
+        }
         for name, actor in self.actors.items():
             if actor is not None and actor.is_alive:
-                self.controllers[name] = VehiclePIDController(actor, args_lateral=args_lat, args_longitudinal=args_lon)
+                self.controllers[name] = VehiclePIDController(
+                    actor,
+                    args_lateral=args_lat,
+                    args_longitudinal=args_lon,
+                    max_throttle=float(self.config.get("pid_max_throttle", 0.35)),
+                    max_brake=float(self.config.get("pid_max_brake", 0.2)),
+                    max_steering=float(self.config.get("pid_max_steering", 0.5)),
+                )
 
     def set_planned_behavior(self, plan: PlannedBehavior) -> None:
         self.active[plan.actor_name] = plan
         self.path_progress[plan.actor_name] = 0
+        self.last_plan_start_s[plan.actor_name] = plan.start_time_s
         if self.trace_writer:
             self.trace_writer.write({
                 "event": "planned_behavior_set",
@@ -81,6 +101,7 @@ class AttackManager:
                 "planner_status": plan.planner_status,
                 "path_len": len(plan.path_waypoints),
                 "speed_profile": plan.speed_profile,
+                "resolved_physical_params": plan.resolved_physical_params,
             })
 
     def active_behaviors(self) -> Dict[str, str]:
@@ -88,6 +109,11 @@ class AttackManager:
 
     def active_command_ids(self) -> List[str]:
         return [plan.command_id for plan in self.active.values()]
+
+    def min_active_elapsed_s(self, sim_time_s: float) -> float:
+        if not self.active:
+            return float("inf")
+        return min(max(0.0, sim_time_s - plan.start_time_s) for plan in self.active.values())
 
     def behavior_progress(self, sim_time_s: float) -> Dict[str, Dict[str, Any]]:
         progress = {}
