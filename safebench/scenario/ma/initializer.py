@@ -80,6 +80,10 @@ class MAScenarioInitializer:
                         continue
                     self._set_initial_velocity(striker, striker_wp)
                     for blocker_offset in blocker_offsets:
+                        min_clearance = float(self.config.get("min_initial_blocker_clearance_m", 5.0))
+                        if float(striker_offset) >= float(blocker_offset) - min_clearance:
+                            init_meta["failure_reason"] = "initial_striker_blocker_slot_clearance_too_small"
+                            continue
                         blocker_wp = _advance(anchor, blocker_offset)
                         blocker = self._try_spawn("blocker_1", blocker_wp.transform)
                         init_meta["spawn_retry_count"] += 1

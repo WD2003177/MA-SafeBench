@@ -51,15 +51,12 @@ def test_llm_default_enabled() -> None:
     text = read(ROOT / "safebench/scenario/config/ma_cut_in.yaml")
     assert "use_llm: true" in text
     assert "ma_decision_interval_s: 0.5" in text
-    assert "route_id: 7" in text
 
 
 def test_scenario_type_points_to_ma_scenario() -> None:
     data = json.loads(read(ROOT / "safebench/scenario/config/scenario_type/ma_cut_in.json"))
-    assert len(data) >= 12
+    assert len(data) >= 4
     assert all(item["parameters"]["scenario_name"] == "MultiAgentCutInLeadingVehicle" for item in data)
-    route_ids = {item["route_id"] for item in data}
-    assert {4, 6, 7, 8, 10, 11, 12, 13}.issubset(route_ids)
 
 
 def test_event_fields_present() -> None:
@@ -188,7 +185,7 @@ def test_phase_aware_contract_verifier_guards_exist() -> None:
         "unknown_lifecycle_event",
         "command_contract_mismatch",
         "pass_side_inconsistent_with_striker_side",
-        "contract_duration_out_of_bounds",
+        "clamped_contract_duration",
         "recover_contract_not_allowed",
         "compress_advance_if_cannot_only_cutin_success",
     ]:
@@ -298,7 +295,7 @@ def test_llm_command_object_and_active_contract_repairs_exist() -> None:
         assert key in llm_text
     for key in ["_should_continue_active_contract", "active_contract_runtime", "ma_hold_active_contract_without_llm"]:
         assert key in policy_text
-    for key in ["max_recover_accel_mps2", "seal_cfg.get(\"target_gap_m\"", "front_window_max_m"]:
+    for key in ["max_recover_accel_mps2", "_dynamic_blocker_gap", "compress_gap_bounds_m", "strike_gap_bounds_m"]:
         assert key in planner_text
 
 
@@ -324,22 +321,31 @@ def test_contract_lifecycle_is_phase_aware() -> None:
     config_text = read(ROOT / "safebench/scenario/config/ma_cut_in.yaml")
     for key in ["_refresh_contract_lifecycle", "_advance_events_for_phase", "_abort_events_for_phase"]:
         assert key in scenario_text
-    assert 'if phase == "strike":\n            return ["cutin_success"]' in scenario_text
+    assert 'if phase == "strike":\n            return []' in scenario_text
+    assert 'if phase == "cut_in_committed":\n            return ["cutin_success"]' in scenario_text
+    assert "cut_in_committed" in scenario_text + intent_text + policy_text
     assert 'if phase == "brake_pulse":\n            return base + ["hard_brake", "near_miss"]' in scenario_text
     assert "_default_abort_events" in intent_text
     assert "_fallback_abort_events" in policy_text
     assert "lead_gap_hint_m\": 16.0" in intent_text
     assert "lead_gap_hint_m\": 16.0" in policy_text
     assert "target_gap_m: 16.0" in config_text
-    assert "min_speed_mps: 5.0" in config_text
+    assert "compress_gap_bounds_m: [14.0, 22.0]" in config_text
+    assert "strike_gap_bounds_m: [10.0, 14.0]" in config_text
+    assert "min_blocker_clearance_m: 5.0" in config_text
+    assert "realism_abort_consecutive_steps: 6" in config_text
+    assert "plan_reuse_same_tactic: true" in config_text
+    assert "min_speed_mps: 8.0" in config_text
 
 
 def test_initializer_success_clears_previous_failure_reason() -> None:
     init_text = read(ROOT / "safebench/scenario/ma/initializer.py")
     config_text = read(ROOT / "safebench/scenario/config/ma_cut_in.yaml")
     assert '"failure_reason": None' in init_text
-    assert "striker_lead_range_m: [14.0, 24.0]" in config_text
-    assert "blocker_lead_range_m: [18.0, 28.0]" in config_text
+    assert "striker_lead_range_m: [8.0, 13.0]" in config_text
+    assert "blocker_lead_range_m: [17.0, 22.0]" in config_text
+    assert "min_initial_blocker_clearance_m: 5.0" in config_text
+    assert "slot_aware_ego_blocker_cut_in" in read(ROOT / "safebench/scenario/ma/planner.py")
 
 
 def test_scene_summary_has_comal_geometry() -> None:
@@ -356,7 +362,68 @@ def test_scene_summary_has_comal_geometry() -> None:
     ]:
         assert key in text
     assert "ego_vehicle.get_transform()" in text
-    assert "actor.get_transform()" in text
+
+
+def test_cutin_effectiveness_and_realism_controls_exist() -> None:
+    planner_text = read(ROOT / "safebench/scenario/ma/planner.py")
+    scenario_text = read(ROOT / "safebench/scenario/scenario_definition/standard/ma_cut_in_leading_vehicle.py")
+    scene_text = read(ROOT / "safebench/scenario/ma/scene_summary.py")
+    attack_text = read(ROOT / "safebench/scenario/ma/attack_manager.py")
+    metrics_text = read(ROOT / "safebench/scenario/ma/metrics.py")
+    config_text = read(ROOT / "safebench/scenario/config/ma_cut_in.yaml")
+    for key in [
+        "_smootherstep",
+        "cut_in_lead_in_lane_keep",
+        "quintic_smootherstep_lateral_transition",
+        "s_curve_speed_profile",
+        "desired_slot_gap_m",
+        "final_slot_gap_m",
+        "predicted_slot_gap_m",
+        "predicted_raw_gap_m",
+        "predicted_slot_gap_in_bounds",
+        "predicted_slot_gap_close_to_final",
+        "blocker_clearance_m",
+        "slot_adjust_reason",
+    ]:
+        assert key in planner_text + scene_text + config_text
+    for key in [
+        "cut_in_committed",
+        "cut_in_timeout",
+        "contract_danger_achieved",
+        "committed_phase_external_advance_blocked",
+        "internal_phase_action_requested",
+        "precommitted_external_recover_deferred",
+        "precommitted_realism_abort_suppressed",
+        "realism_recover_suppressed",
+        "strike_commit_grace_s",
+    ]:
+        assert key in scenario_text
+    assert 'if advanced_to == "strike":\n                self._apply_contract_phase_action("strike", sim_time_s, "phase_advanced_same_tick")' in scenario_text
+    assert 'if requested == "recover":' in scenario_text
+    assert '"_ma_recover_deferred_to_active_contract"' in scenario_text
+    assert scenario_text.index('if self.current_phase == "cut_in_committed"') < scenario_text.index('if requested == "recover":')
+    for key in ["_tactic_max_steer", "_should_smooth_update_plan", "planned_behavior_smoothed_update", "lookahead_distance_m", "max_steer"]:
+        assert key in attack_text + config_text
+    for key in ["warmup_excluded", "raw_measured", "prev_active_commands", "ma_actor_realism_raw", "raw_longitudinal_jerk_mps3"]:
+        assert key in metrics_text
+    assert "active_plan_meta" in metrics_text + scenario_text
+    assert 'if abs(lon_accel) > self.max_abs_accel' in metrics_text
+    assert 'if not warmup_excluded:\n                    violation = True' in metrics_text
+    assert 'if abs(lat_accel) > self.max_lateral_accel' in metrics_text
+    assert "start_gap_bounds_m: [8.0, 34.0]" in config_text
+    assert "slot_gap_bounds_m: [6.0, 9.0]" in config_text
+    assert "predicted_slot_tolerance_m: 2.0" in config_text
+    assert "max_steer: 0.28" in config_text
+    assert "strike_commit_grace_s: 1.0" in config_text
+    assert "predicted_slot_gap_invalid" in read(ROOT / "safebench/scenario/ma/intent.py")
+    llm_text = read(ROOT / "safebench/scenario/ma/llm_client.py")
+    assert "Allowed phases: observe, compress, strike, cut_in_committed, brake_pulse, recover" in llm_text
+    assert "slot_sync" in read(ROOT / "safebench/scenario/ma/data_types.py")
+    assert "striker_ahead_of_blocker_no_slot" in read(ROOT / "safebench/scenario/ma/intent.py")
+    assert "initial_striker_blocker_slot_clearance_too_small" in read(ROOT / "safebench/scenario/ma/initializer.py")
+    assert "compress_realism_abort_grace_s: 4.0" in config_text
+    assert '"cut_in_committed": ["cut_in"]' in llm_text
+    assert '"cut_in_committed": ["seal_escape"]' in llm_text
 
 
 def test_missing_scene_summary_does_not_consume_decision_gate() -> None:

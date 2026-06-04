@@ -4,20 +4,21 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 
-ALLOWED_TACTICS = ("gain_lead", "seal_escape", "cut_in", "front_brake", "recover")
+ALLOWED_TACTICS = ("gain_lead", "slot_sync", "seal_escape", "cut_in", "front_brake", "recover")
 ALLOWED_BEHAVIORS = ALLOWED_TACTICS + ("cut_in_and_brake", "block_ego_lane")
-ALLOWED_PHASES = ("observe", "compress", "strike", "brake_pulse", "recover")
+ALLOWED_PHASES = ("observe", "compress", "strike", "cut_in_committed", "brake_pulse", "recover")
 ALLOWED_PASS_SIDES = ("left", "right")
 ALLOWED_BLOCKER_OBJECTIVES = ("seal_left", "seal_right", "seal_front")
 ALLOWED_STRIKER_OBJECTIVES = ("pass_left", "pass_right", "cut_in_front", "gain_lead")
 ALLOWED_ADVANCE_EVENTS = ("blocker_seal_success", "striker_cutin_window_ready", "cutin_success")
-ALLOWED_ABORT_EVENTS = ("realism_violation", "teleport_detected", "attacker_offroad", "hard_brake", "near_miss")
+ALLOWED_ABORT_EVENTS = ("realism_violation", "teleport_detected", "attacker_offroad", "hard_brake", "near_miss", "cut_in_timeout")
 ALLOWED_RENEGOTIATE_EVENTS = ("contract_timeout", "striker_window_lost", "blocker_seal_lost", "ego_lane_changed", "pass_side_blocked")
 ALLOWED_CONTRACT_EVENTS = ALLOWED_ADVANCE_EVENTS + ALLOWED_ABORT_EVENTS + ALLOWED_RENEGOTIATE_EVENTS
 PHASE_ALLOWED_TACTICS = {
     "observe": tuple(),
-    "compress": ("gain_lead", "seal_escape"),
+    "compress": ("gain_lead", "slot_sync", "seal_escape"),
     "strike": ("cut_in", "seal_escape"),
+    "cut_in_committed": ("cut_in", "seal_escape"),
     "brake_pulse": ("front_brake", "seal_escape"),
     "recover": ("recover",),
 }

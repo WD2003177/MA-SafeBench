@@ -183,10 +183,12 @@ class MAAttackPolicy(BasePolicy):
         if not isinstance(summary, dict) or summary.get("contract_status") != "active":
             return False
         phase = summary.get("phase")
-        if phase not in ("compress", "strike", "brake_pulse"):
+        if phase not in ("compress", "strike", "cut_in_committed", "brake_pulse"):
             return False
         risk = summary.get("risk_snapshot", {}) if isinstance(summary.get("risk_snapshot", {}), dict) else {}
-        if risk.get("ma_realism_violation_step") or risk.get("ma_event_hard_brake") or risk.get("ma_event_near_miss"):
+        if phase == "brake_pulse" and (risk.get("ma_event_hard_brake") or risk.get("ma_event_near_miss")):
+            return False
+        if risk.get("ma_realism_violation_step") and self._realism_violation_streak(risk) >= self._realism_abort_required_steps():
             return False
         return True
 
@@ -202,15 +204,19 @@ class MAAttackPolicy(BasePolicy):
                 risk = summary.get("risk_snapshot", {}) if isinstance(summary.get("risk_snapshot", {}), dict) else {}
                 summary_phase = summary.get("phase", phase)
                 contract_status = summary.get("contract_status", "none")
-                if summary_phase in ("compress", "strike", "brake_pulse") and contract_status == "active":
+                if summary_phase in ("compress", "strike", "cut_in_committed", "brake_pulse") and contract_status == "active":
                     phase = summary_phase
                 else:
                     phase = "compress"
                 geometry = summary.get("coordination_geometry", {}) if isinstance(summary.get("coordination_geometry", {}), dict) else {}
-        if risk.get("ma_event_hard_brake") or risk.get("ma_event_near_miss") or risk.get("ma_realism_violation_step"):
+        if (phase == "brake_pulse" and (risk.get("ma_event_hard_brake") or risk.get("ma_event_near_miss"))) or (
+            risk.get("ma_realism_violation_step") and self._realism_violation_streak(risk) >= self._realism_abort_required_steps()
+        ):
             phase = "recover"
         elif risk.get("ma_event_cutin_success"):
             phase = "brake_pulse"
+        elif phase == "cut_in_committed":
+            phase = "cut_in_committed"
         elif geometry.get("blocker_seal_success") and geometry.get("striker_cutin_window_ready"):
             phase = "strike"
         striker_hints, blocker_hints = self._adaptive_hints(risk)
@@ -227,7 +233,7 @@ class MAAttackPolicy(BasePolicy):
                 })
             return {"phase": "recover", "commands": commands}
         contract = self._fallback_contract(phase, attackers, striker_hints)
-        if phase in ("compress", "strike", "brake_pulse") and ("blocker_1" in attackers or not attackers):
+        if phase in ("compress", "strike", "cut_in_committed", "brake_pulse") and ("blocker_1" in attackers or not attackers):
             commands.append({
                 "actor_name": "blocker_1",
                 "role": "Blocker",
@@ -240,12 +246,12 @@ class MAAttackPolicy(BasePolicy):
             commands.append({
                 "actor_name": "attacker_1",
                 "role": "Striker",
-                "tactic": "gain_lead",
+                "tactic": "slot_sync",
                 "target_actor": "ego",
                 "style": "prepare_cut_in_window",
                 "hints": striker_hints,
             })
-        elif phase == "strike" and ("attacker_1" in attackers or not attackers):
+        elif phase in ("strike", "cut_in_committed") and ("attacker_1" in attackers or not attackers):
             commands.append({
                 "actor_name": "attacker_1",
                 "role": "Striker",
@@ -278,7 +284,9 @@ class MAAttackPolicy(BasePolicy):
         if summary.get("contract_status") == "active":
             return None
         risk = summary.get("risk_snapshot", {}) if isinstance(summary.get("risk_snapshot", {}), dict) else {}
-        if risk.get("ma_realism_violation_step") or risk.get("ma_event_hard_brake") or risk.get("ma_event_near_miss"):
+        if risk.get("ma_event_hard_brake") or risk.get("ma_event_near_miss"):
+            return None
+        if risk.get("ma_realism_violation_step") and self._realism_violation_streak(risk) >= self._realism_abort_required_steps():
             return None
         geometry = summary.get("coordination_geometry", {}) if isinstance(summary.get("coordination_geometry", {}), dict) else {}
         if not bool(geometry.get("initial_attack_window_valid")):
@@ -300,6 +308,7 @@ class MAAttackPolicy(BasePolicy):
         objective_by_phase = {
             "compress": "gain_lead",
             "strike": "cut_in_front",
+            "cut_in_committed": "cut_in_front",
             "brake_pulse": "cut_in_front",
         }
         return {
@@ -314,13 +323,15 @@ class MAAttackPolicy(BasePolicy):
             "duration_s": 8.0,
             "target_gap_m": float(striker_hints.get("target_gap_m", 6.0)),
             "merge_s_offset_m": float(striker_hints.get("merge_s_offset_m", 10.0)),
-            "advance_if": ["blocker_seal_success", "striker_cutin_window_ready"] if phase == "compress" else (["cutin_success"] if phase == "strike" else []),
+            "advance_if": ["blocker_seal_success", "striker_cutin_window_ready"] if phase == "compress" else (["cutin_success"] if phase == "cut_in_committed" else []),
             "abort_if": self._fallback_abort_events(phase),
-            "renegotiate_if": ["contract_timeout", "striker_window_lost", "blocker_seal_lost", "ego_lane_changed", "pass_side_blocked"],
+            "renegotiate_if": [] if phase == "cut_in_committed" else ["contract_timeout", "striker_window_lost", "blocker_seal_lost", "ego_lane_changed", "pass_side_blocked"],
         }
 
     def _fallback_abort_events(self, phase: str) -> List[str]:
         base = ["realism_violation", "teleport_detected", "attacker_offroad"]
+        if phase == "cut_in_committed":
+            return ["teleport_detected", "attacker_offroad", "cut_in_timeout"]
         if phase == "brake_pulse":
             return base + ["hard_brake", "near_miss"]
         return base
@@ -337,6 +348,16 @@ class MAAttackPolicy(BasePolicy):
             striker_hints.update({"merge_timing": "normal", "brake_style": "moderate"})
             blocker_hints.update({"speed_delta_hint_mps": -0.5})
         return striker_hints, blocker_hints
+
+    def _realism_abort_required_steps(self) -> int:
+        planner_cfg = self.config.get("planner", {}) if isinstance(self.config.get("planner", {}), dict) else {}
+        return max(1, int(planner_cfg.get("realism_abort_consecutive_steps", 3)))
+
+    def _realism_violation_streak(self, risk: Dict[str, Any]) -> int:
+        try:
+            return int(risk.get("ma_realism_violation_streak", 0))
+        except (TypeError, ValueError):
+            return 0
 
     def _sim_time(self, info: Dict[str, Any], step: int) -> float:
         if isinstance(info, dict):

@@ -48,13 +48,18 @@ planner:
   pid_lateral_kp: 1.2
   pid_lateral_ki: 0.02
   pid_lateral_kd: 0.08
-  pid_longitudinal_kp: 0.35
+  pid_longitudinal_kp: 0.5
   pid_longitudinal_ki: 0.02
   pid_longitudinal_kd: 0.0
-  pid_max_throttle: 0.35
+  pid_max_throttle: 0.55
   pid_max_brake: 0.2
   pid_max_steering: 0.5
-  realism_abort_grace_s: 1.0
+  realism_abort_grace_s: 2.5
+  compress_realism_abort_grace_s: 4.0
+  strike_commit_grace_s: 1.0
+  realism_abort_consecutive_steps: 6
+  plan_reuse_min_remaining_s: 0.8
+  plan_reuse_same_tactic: true
   lookahead_distance_m: 6.0
   waypoint_spacing_m: 1.5
   max_plan_horizon_s: 6.0
@@ -68,7 +73,7 @@ planner:
 
   contract:
     duration_s: 8.0
-    duration_bounds_s: [2.0, 12.0]
+    duration_bounds_s: [6.0, 12.0]
 
   soft_hints:
     default_gap_band: normal
@@ -93,11 +98,12 @@ planner:
     max_lane_heading_diff_deg: 30.0
     side_candidates: ['left', 'right']
     anchor_distances_m: [0, 5, 10, 15]
-    striker_lead_range_m: [14.0, 24.0]
-    blocker_lead_range_m: [18.0, 28.0]
-    striker_lead_offsets_m: [14, 16, 18, 20, 22, 24]
-    blocker_lead_offsets_m: [18, 20, 22, 25, 28]
-    striker_prepare_window_m: [12.0, 35.0]
+    striker_lead_range_m: [8.0, 13.0]
+    blocker_lead_range_m: [17.0, 22.0]
+    striker_lead_offsets_m: [8, 10, 12, 13]
+    blocker_lead_offsets_m: [17, 19, 21, 22]
+    striker_prepare_window_m: [8.0, 18.0]
+    min_initial_blocker_clearance_m: 5.0
     actor_models:
       attacker_1: 'vehicle.audi.tt'
       blocker_1: 'vehicle.nissan.patrol'
@@ -117,14 +123,33 @@ planner:
     post_brake_duration_s: 1.0
 
   gain_lead:
-    duration_s: 3.0
-    speed_delta_mps: 2.0
-    min_speed_mps: 6.0
+    duration_s: 4.0
+    speed_ramp_s: 2.5
+    speed_delta_mps: 2.5
+    min_speed_mps: 8.0
     max_speed_mps: 11.0
 
+  slot_sync:
+    duration_s: 4.0
+    speed_ramp_s: 2.5
+    min_speed_mps: 5.0
+    max_speed_mps: 10.5
+
   cut_in:
-    target_gap_m: 6.0
-    target_gap_bounds_m: [4.0, 15.0]
+    target_gap_m: 7.0
+    target_gap_bounds_m: [6.0, 9.0]
+    slot_gap_bounds_m: [6.0, 9.0]
+    desired_slot_gap_m: 7.0
+    start_gap_bounds_m: [8.0, 34.0]
+    predicted_slot_gap_bounds_m: [6.0, 9.0]
+    predicted_slot_tolerance_m: 2.0
+    min_blocker_clearance_m: 5.0
+    lead_in_time_s: 0.6
+    lead_in_distance_m: 4.5
+    lane_change_safety_factor: 1.4
+    lookahead_distance_m: 3.5
+    max_steer: 0.28
+    committed_timeout_s: 5.5
     lane_change_duration_s: 2.8
     lane_change_duration_bounds_s: [2.0, 5.0]
     merge_s_offset_m: 10.0
@@ -158,11 +183,14 @@ planner:
 
   seal_escape:
     target_gap_m: 16.0
-    target_gap_bounds_m: [8.0, 35.0]
+    target_gap_bounds_m: [10.0, 20.0]
+    compress_gap_bounds_m: [14.0, 22.0]
+    strike_gap_bounds_m: [10.0, 14.0]
     front_window_min_m: 8.0
-    front_window_max_m: 35.0
-    speed_delta_mps: -0.8
-    min_speed_mps: 5.0
+    front_window_max_m: 24.0
+    speed_delta_mps: 0.2
+    speed_ramp_s: 1.8
+    min_speed_mps: 6.0
     max_speed_mps: 10.5
     max_decel_mps2: -2.0
     hold_duration_s: 5.0

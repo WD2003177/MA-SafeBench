@@ -54,8 +54,7 @@ class ScenicRunner:
 
         # apply settings to carla
         self.client = carla.Client('localhost', scenario_config['port'])
-        self.client_timeout_s = float(scenario_config.get('carla_timeout_s', 60.0))
-        self.client.set_timeout(self.client_timeout_s)
+        self.client.set_timeout(10.0)
         self.world = None
         self.env = None
 
@@ -134,12 +133,7 @@ class ScenicRunner:
         self.logger.log(">> Initializing carla world")
         self.world = self.client.get_world()
         self.world.scenic = self.scenic
-        self.traffic_manager = self.client.get_trafficmanager(self.scenario_config['tm_port'])
-        self.traffic_manager.set_synchronous_mode(self.world.get_settings().synchronous_mode)
-        self.traffic_manager.set_random_device_seed(self.seed)
-        self.traffic_manager.set_hybrid_physics_mode(False)
         CarlaDataProvider.set_client(self.client)
-        CarlaDataProvider.set_carla_timeout(self.client_timeout_s)
         CarlaDataProvider.set_world(self.world)
         CarlaDataProvider.set_traffic_manager_port(self.scenario_config['tm_port'])
         

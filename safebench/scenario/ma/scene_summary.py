@@ -88,6 +88,65 @@ def _front_gap(ego_tf, actors: Dict[str, Any]) -> float:
     return -1.0 if front is None else front
 
 
+def _dynamic_blocker_window(phase: str, ego_speed: float, bounds: Dict[str, Any]) -> List[float]:
+    seal_cfg = bounds.get("seal_escape", {}) if isinstance(bounds.get("seal_escape", {}), dict) else {}
+    if phase in ("strike", "cut_in_committed", "brake_pulse"):
+        gap_bounds = seal_cfg.get("strike_gap_bounds_m", [10.0, 14.0])
+        headway = float(seal_cfg.get("strike_time_headway_s", 1.0))
+    else:
+        gap_bounds = seal_cfg.get("compress_gap_bounds_m", [14.0, 20.0])
+        headway = float(seal_cfg.get("compress_time_headway_s", 1.4))
+    desired = max(float(gap_bounds[0]), min(float(gap_bounds[1]), ego_speed * headway + 4.0))
+    return [float(gap_bounds[0]), float(gap_bounds[1]), desired]
+
+
+def _predicted_cutin_geometry(striker_item: Dict[str, Any], blocker_gap: Optional[float], ego_speed: float, bounds: Dict[str, Any]) -> Dict[str, Any]:
+    cut_cfg = bounds.get("cut_in", {}) if isinstance(bounds.get("cut_in", {}), dict) else {}
+    desired_bounds = cut_cfg.get("slot_gap_bounds_m", bounds.get("target_gap_m", [6.0, 9.0]))
+    desired_slot = max(float(desired_bounds[0]), min(float(desired_bounds[1]), float(cut_cfg.get("desired_slot_gap_m", cut_cfg.get("target_gap_m", 7.0)))))
+    min_clearance = float(bounds.get("min_blocker_clearance_m", cut_cfg.get("min_blocker_clearance_m", 5.0)))
+    lead_in_s = float(cut_cfg.get("lead_in_time_s", 0.6))
+    duration_bounds = bounds.get("lane_change_duration_s", cut_cfg.get("lane_change_duration_bounds_s", [2.0, 5.0]))
+    lane_change_s = float(duration_bounds[1] if isinstance(duration_bounds, list) and len(duration_bounds) > 1 else 3.5)
+    horizon = lead_in_s + lane_change_s
+    current_gap = float(striker_item.get("longitudinal_gap_to_ego_m") or 0.0)
+    striker_speed = float(striker_item.get("speed_mps") or 0.0)
+    predicted_gap = current_gap - max(0.0, ego_speed - striker_speed) * horizon
+    start_bounds = bounds.get("cutin_start_window_m", [10.0, 34.0])
+    predicted_bounds = cut_cfg.get("predicted_slot_gap_bounds_m", desired_bounds)
+    tolerance = float(cut_cfg.get("predicted_slot_tolerance_m", 2.0))
+    blocker_clearance = None if blocker_gap is None else blocker_gap - desired_slot
+    final_slot = desired_slot
+    slot_adjust_reason = "ego_blocker_slot"
+    if blocker_clearance is not None and blocker_clearance < min_clearance:
+        final_slot = max(0.0, blocker_gap - min_clearance)
+        slot_adjust_reason = "blocker_clearance_too_small" if final_slot < float(desired_bounds[0]) else "slot_reduced_for_blocker_clearance"
+    predicted_in_bounds = float(predicted_bounds[0]) <= predicted_gap <= float(predicted_bounds[1])
+    predicted_close_to_final = abs(predicted_gap - final_slot) <= tolerance
+    ready = bool(
+        striker_item.get("striker_in_adjacent_lane")
+        and striker_item.get("same_road_as_ego")
+        and float(start_bounds[0]) <= current_gap <= float(start_bounds[1])
+        and (predicted_in_bounds or predicted_close_to_final)
+        and blocker_gap is not None
+        and final_slot >= float(desired_bounds[0])
+        and (blocker_gap - final_slot) >= min_clearance
+    )
+    return {
+        "predicted_cutin_slot_ready": ready,
+        "desired_slot_gap_m": desired_slot,
+        "final_slot_gap_m": final_slot,
+        "predicted_slot_gap_m": predicted_gap,
+        "predicted_raw_gap_m": predicted_gap,
+        "predicted_slot_gap_bounds_m": [float(predicted_bounds[0]), float(predicted_bounds[1])],
+        "predicted_slot_gap_in_bounds": predicted_in_bounds,
+        "predicted_slot_gap_close_to_final": predicted_close_to_final,
+        "blocker_clearance_m": None if blocker_gap is None else blocker_gap - final_slot,
+        "slot_adjust_reason": slot_adjust_reason,
+        "prediction_horizon_s": horizon,
+    }
+
+
 def build_scene_summary(
     ego_vehicle,
     actors: Dict[str, Any],
@@ -124,9 +183,10 @@ def build_scene_summary(
     ego_wp = CarlaDataProvider.get_map().get_waypoint(ego_tf.location, project_to_road=True)
     ego_speed = _speed_mps(ego_vehicle)
     attackers: List[Dict[str, Any]] = []
+    actor_states: Dict[str, Dict[str, Any]] = {}
     min_ttc = -1.0
     max_closing = 0.0
-    blocker_window = bounds.get("blocker_front_window_m", [8.0, 35.0])
+    blocker_window = _dynamic_blocker_window(active_phase, ego_speed, bounds)
     striker_prepare_window = bounds.get("striker_prepare_window_m", [12.0, 35.0])
     for name, actor in actors.items():
         if actor is None:
@@ -146,7 +206,13 @@ def build_scene_summary(
         max_closing = max(max_closing, closing)
         relation = _lateral_relation(ego_wp, wp, ego_tf, tf)
         same_road = bool(ego_wp and wp and ego_wp.road_id == wp.road_id)
-        cutin_gap_bounds = bounds.get("target_gap_m", [4.0, 15.0])
+        cutin_gap_bounds = bounds.get("cutin_start_window_m", bounds.get("target_gap_m", [4.0, 15.0]))
+        actor_states[name] = {
+            "role": meta.role_hint if meta else name,
+            "gap": gap,
+            "relation": relation,
+            "same_road": same_road,
+        }
         in_cutin_window = bool(
             meta
             and meta.role_hint == "Striker"
@@ -192,6 +258,26 @@ def build_scene_summary(
             "active_tactic": active_behavior.get(name),
             "behavior_progress": (behavior_progress or {}).get(name),
         })
+    blocker_gaps = [state["gap"] for state in actor_states.values() if state.get("role") == "Blocker" and state.get("relation") == "same_lane" and state.get("same_road")]
+    blocker_gap = min(blocker_gaps) if blocker_gaps else None
+    cut_in_cfg = bounds.get("cut_in", {}) if isinstance(bounds.get("cut_in", {}), dict) else {}
+    min_blocker_clearance = float(bounds.get("min_blocker_clearance_m", cut_in_cfg.get("min_blocker_clearance_m", 5.0)))
+    for item in attackers:
+        if item.get("role_hint") != "Striker":
+            item["striker_between_ego_and_blocker"] = False
+            item["striker_blocker_clearance_m"] = None
+            continue
+        clearance = None if blocker_gap is None else blocker_gap - float(item.get("longitudinal_gap_to_ego_m") or 0.0)
+        between = bool(
+            item.get("striker_in_cutin_window")
+            and blocker_gap is not None
+            and clearance is not None
+            and clearance >= min_blocker_clearance
+        )
+        item["striker_between_ego_and_blocker"] = between
+        item["striker_blocker_clearance_m"] = clearance
+        predicted = _predicted_cutin_geometry(item, blocker_gap, ego_speed, bounds)
+        item.update(predicted)
     escape_lanes = _escape_lanes(ego_wp)
     blocker_front_window_ready = any(item["blocker_in_front_window"] for item in attackers)
     striker_prepare_window_ready = any(item["striker_in_prepare_window"] for item in attackers)
@@ -238,13 +324,23 @@ def build_scene_summary(
         "coordination_geometry": {
             "min_ttc_s": min_ttc,
             "max_closing_speed_mps": max_closing,
-            "blocker_front_window_m": blocker_window,
+            "blocker_front_window_m": blocker_window[:2],
+            "dynamic_blocker_target_gap_m": blocker_window[2],
             "striker_prepare_window_m": striker_prepare_window,
             "blocker_front_window_ready": blocker_front_window_ready,
             "striker_prepare_window_ready": striker_prepare_window_ready,
             "initial_attack_window_valid": initial_attack_window_valid,
             "blocker_seal_success": any(item["blocker_sealing_ego_front"] for item in attackers),
-            "striker_cutin_window_ready": any(item["striker_in_cutin_window"] for item in attackers),
+            "blocker_gap_to_ego_m": blocker_gap,
+            "min_blocker_clearance_m": min_blocker_clearance,
+            "striker_cutin_window_ready": any(item.get("predicted_cutin_slot_ready") for item in attackers),
+            "predicted_cutin_slot_ready": any(item.get("predicted_cutin_slot_ready") for item in attackers),
+            "desired_slot_gap_m": next((item.get("desired_slot_gap_m") for item in attackers if item.get("role_hint") == "Striker"), None),
+            "final_slot_gap_m": next((item.get("final_slot_gap_m") for item in attackers if item.get("role_hint") == "Striker"), None),
+            "predicted_slot_gap_m": next((item.get("predicted_slot_gap_m") for item in attackers if item.get("role_hint") == "Striker"), None),
+            "blocker_clearance_m": next((item.get("blocker_clearance_m") for item in attackers if item.get("role_hint") == "Striker"), None),
+            "slot_adjust_reason": next((item.get("slot_adjust_reason") for item in attackers if item.get("role_hint") == "Striker"), None),
+            "striker_raw_cutin_gap_ready": any(item["striker_in_cutin_window"] for item in attackers),
         },
         "risk_snapshot": risk_snapshot,
         "allowed_phases": list(ALLOWED_PHASES),

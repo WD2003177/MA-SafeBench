@@ -44,6 +44,7 @@ class MARiskMetrics:
         self.prev_ego_accel = None
         self.prev_actor_locations = {}
         self.prev_actor_accels = {}
+        self.prev_active_commands = {}
         self.episode_min_ttc = float("inf")
         self.episode_min_distance = float("inf")
         self.episode_ego_max_decel = 0.0
@@ -62,9 +63,11 @@ class MARiskMetrics:
         self.episode_realism_valid_attack = False
         self.step_record = {}
         self.last_realism_violation_reasons = []
+        self.step_actor_realism_raw = {}
 
-    def update(self, ego_vehicle, actors: Dict[str, Any], active_behaviors: Dict[str, str], sim_time_s: float, dt: float) -> Dict[str, Any]:
+    def update(self, ego_vehicle, actors: Dict[str, Any], active_behaviors: Dict[str, str], sim_time_s: float, dt: float, active_plan_meta: Dict[str, Dict[str, Any]] = None) -> Dict[str, Any]:
         dt = max(float(dt), 1e-3)
+        active_plan_meta = active_plan_meta or {}
         ego_speed = _speed(ego_vehicle)
         ego_accel = 0.0 if self.prev_ego_speed is None else (ego_speed - self.prev_ego_speed) / dt
         ego_jerk = 0.0 if self.prev_ego_accel is None else (ego_accel - self.prev_ego_accel) / dt
@@ -79,6 +82,7 @@ class MARiskMetrics:
         max_jump = 0.0
         self._step_realism_violation = False
         self.last_realism_violation_reasons = []
+        self.step_actor_realism_raw = {}
         carla_map = CarlaDataProvider.get_map()
         ego_wp = carla_map.get_waypoint(ego_vehicle.get_transform().location, project_to_road=True, lane_type=carla.LaneType.Driving)
 
@@ -96,7 +100,12 @@ class MARiskMetrics:
             if strict_wp is None:
                 step_offroad = True
                 self._add_realism_reason(name, "offroad", 1.0, 0.0)
-            self._update_actor_realism(name, actor, wp, dt)
+            plan_meta = active_plan_meta.get(name, {}) if isinstance(active_plan_meta, dict) else {}
+            command_id = plan_meta.get("command_id") if isinstance(plan_meta, dict) else None
+            if command_id is None and active_behaviors.get(name):
+                command_id = "%s:%s" % (name, active_behaviors.get(name))
+            command_changed = command_id is not None and command_id != self.prev_active_commands.get(name)
+            self._update_actor_realism(name, actor, wp, dt, warmup_excluded=bool(command_changed), command_id=command_id)
             if ego_wp is not None and wp is not None and wp.road_id == ego_wp.road_id and wp.lane_id == ego_wp.lane_id and 0.0 < rel_gap <= self.cutin_gap_m:
                 if active_behaviors.get(name) in ("cut_in", "cut_in_and_brake"):
                     step_cutin_success = True
@@ -110,6 +119,11 @@ class MARiskMetrics:
                     step_teleport = True
                     self._add_realism_reason(name, "teleport", jump, margin)
             self.prev_actor_locations[name] = carla.Location(loc.x, loc.y, loc.z)
+        self.prev_active_commands = {
+            name: (meta.get("command_id") if isinstance(meta, dict) else None)
+            for name, meta in active_plan_meta.items()
+            if isinstance(meta, dict) and meta.get("command_id")
+        }
 
         if step_min_distance == float("inf"):
             step_min_distance = -1.0
@@ -150,12 +164,13 @@ class MARiskMetrics:
             "ma_event_hard_brake": step_hard_brake,
             "ma_event_near_miss": step_near_miss,
             "ma_event_realism_valid_attack": (step_cutin_success or step_hard_brake or step_near_miss) and not violation,
+            "ma_actor_realism_raw": dict(self.step_actor_realism_raw),
         }
         self.step_record.update(self.aggregate_record())
         return self.step_record
 
 
-    def _update_actor_realism(self, name: str, actor, waypoint, dt: float) -> bool:
+    def _update_actor_realism(self, name: str, actor, waypoint, dt: float, warmup_excluded: bool = False, command_id: str = None) -> bool:
         try:
             transform = actor.get_transform()
             accel = actor.get_acceleration()
@@ -166,19 +181,31 @@ class MARiskMetrics:
             prev_accel = self.prev_actor_accels.get(name)
             jerk = 0.0 if prev_accel is None else (lon_accel - prev_accel) / max(dt, 1e-3)
             self.prev_actor_accels[name] = lon_accel
-            self.episode_attacker_max_abs_accel = max(self.episode_attacker_max_abs_accel, abs(lon_accel))
-            self.episode_attacker_max_abs_jerk = max(self.episode_attacker_max_abs_jerk, abs(jerk))
-            self.episode_attacker_max_lateral_accel = max(self.episode_attacker_max_lateral_accel, abs(lat_accel))
+            self.step_actor_realism_raw[name] = {
+                "command_id": command_id or "",
+                "raw_longitudinal_accel_mps2": float(lon_accel),
+                "raw_lateral_accel_mps2": float(lat_accel),
+                "raw_longitudinal_jerk_mps3": float(jerk),
+                "warmup_excluded": bool(warmup_excluded),
+            }
+            if not warmup_excluded:
+                self.episode_attacker_max_abs_accel = max(self.episode_attacker_max_abs_accel, abs(lon_accel))
+            if not warmup_excluded:
+                self.episode_attacker_max_abs_jerk = max(self.episode_attacker_max_abs_jerk, abs(jerk))
+                self.episode_attacker_max_lateral_accel = max(self.episode_attacker_max_lateral_accel, abs(lat_accel))
             violation = False
             if abs(lon_accel) > self.max_abs_accel:
-                violation = True
-                self._add_realism_reason(name, "longitudinal_accel", abs(lon_accel), self.max_abs_accel)
+                self._add_realism_reason(name, "longitudinal_accel", abs(lon_accel), self.max_abs_accel, warmup_excluded=warmup_excluded, raw_measured=abs(lon_accel))
+                if not warmup_excluded:
+                    violation = True
             if abs(jerk) > self.max_abs_jerk:
-                violation = True
-                self._add_realism_reason(name, "jerk", abs(jerk), self.max_abs_jerk)
+                self._add_realism_reason(name, "jerk", abs(jerk), self.max_abs_jerk, warmup_excluded=warmup_excluded, raw_measured=abs(jerk))
+                if not warmup_excluded:
+                    violation = True
             if abs(lat_accel) > self.max_lateral_accel:
-                violation = True
-                self._add_realism_reason(name, "lateral_accel", abs(lat_accel), self.max_lateral_accel)
+                self._add_realism_reason(name, "lateral_accel", abs(lat_accel), self.max_lateral_accel, warmup_excluded=warmup_excluded, raw_measured=abs(lat_accel))
+                if not warmup_excluded:
+                    violation = True
             if waypoint is not None:
                 heading_error = abs((transform.rotation.yaw - waypoint.transform.rotation.yaw + 180.0) % 360.0 - 180.0)
                 lane_center_distance = transform.location.distance(waypoint.transform.location)
@@ -194,12 +221,14 @@ class MARiskMetrics:
         except Exception:
             return False
 
-    def _add_realism_reason(self, actor_name: str, reason: str, measured: float, limit: float) -> None:
+    def _add_realism_reason(self, actor_name: str, reason: str, measured: float, limit: float, warmup_excluded: bool = False, raw_measured: float = None) -> None:
         self.last_realism_violation_reasons.append({
             "actor": actor_name,
             "reason": reason,
             "measured": float(measured),
+            "raw_measured": float(raw_measured if raw_measured is not None else measured),
             "limit": float(limit),
+            "warmup_excluded": bool(warmup_excluded),
         })
 
     def aggregate_record(self) -> Dict[str, Any]:

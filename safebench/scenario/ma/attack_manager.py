@@ -88,6 +88,39 @@ class AttackManager:
                 )
 
     def set_planned_behavior(self, plan: PlannedBehavior) -> None:
+        previous = self.active.get(plan.actor_name)
+        if previous is not None and self._should_smooth_update_plan(previous, plan):
+            old_progress = self.path_progress.get(plan.actor_name, 0)
+            self.active[plan.actor_name] = plan
+            self.path_progress[plan.actor_name] = max(0, min(old_progress, max(0, len(plan.path_waypoints) - 1)))
+            self.last_plan_start_s[plan.actor_name] = plan.start_time_s
+            if self.trace_writer:
+                self.trace_writer.write({
+                    "event": "planned_behavior_smoothed_update",
+                    "command_id": plan.command_id,
+                    "previous_command_id": previous.command_id,
+                    "actor_name": plan.actor_name,
+                    "behavior": plan.behavior,
+                    "tactic": plan.tactic,
+                    "preserved_path_progress": self.path_progress[plan.actor_name],
+                    "previous_resolved_physical_params": previous.resolved_physical_params,
+                    "resolved_physical_params": plan.resolved_physical_params,
+                    "reason": "same_tactic_target_changed",
+                })
+            return
+        if previous is not None and self._should_reuse_plan(previous, plan):
+            if self.trace_writer:
+                self.trace_writer.write({
+                    "event": "planned_behavior_reused",
+                    "command_id": plan.command_id,
+                    "active_command_id": previous.command_id,
+                    "actor_name": plan.actor_name,
+                    "behavior": plan.behavior,
+                    "tactic": plan.tactic,
+                    "remaining_s": max(0.0, previous.duration_s - (plan.start_time_s - previous.start_time_s)),
+                    "reason": "same_tactic_active_plan",
+                })
+            return
         self.active[plan.actor_name] = plan
         self.path_progress[plan.actor_name] = 0
         self.last_plan_start_s[plan.actor_name] = plan.start_time_s
@@ -103,6 +136,37 @@ class AttackManager:
                 "speed_profile": plan.speed_profile,
                 "resolved_physical_params": plan.resolved_physical_params,
             })
+
+    def _should_reuse_plan(self, previous: PlannedBehavior, incoming: PlannedBehavior) -> bool:
+        if not bool(self.config.get("plan_reuse_same_tactic", True)):
+            return False
+        if previous.tactic != incoming.tactic or previous.behavior != incoming.behavior:
+            return False
+        if incoming.tactic == "recover":
+            return False
+        elapsed = max(0.0, incoming.start_time_s - previous.start_time_s)
+        remaining = previous.duration_s - elapsed
+        min_remaining = float(self.config.get("plan_reuse_min_remaining_s", 0.8))
+        return remaining >= min_remaining
+
+    def _should_smooth_update_plan(self, previous: PlannedBehavior, incoming: PlannedBehavior) -> bool:
+        if previous.tactic != incoming.tactic or previous.behavior != incoming.behavior:
+            return False
+        if incoming.tactic != "seal_escape":
+            return False
+        return self._plan_target_signature(previous) != self._plan_target_signature(incoming)
+
+    def _plan_target_signature(self, plan: PlannedBehavior):
+        params = plan.resolved_physical_params or {}
+        target_gap = params.get("target_gap_m")
+        bounds = params.get("dynamic_gap_bounds_m")
+        try:
+            target_gap = round(float(target_gap), 2)
+        except (TypeError, ValueError):
+            target_gap = None
+        if isinstance(bounds, list):
+            bounds = tuple(round(float(item), 2) for item in bounds)
+        return target_gap, bounds
 
     def active_behaviors(self) -> Dict[str, str]:
         return {name: plan.behavior for name, plan in self.active.items()}
@@ -152,6 +216,9 @@ class AttackManager:
                 target_speed_mps = self._recover_target_speed(actor, target_speed_mps, dt)
             target_speed_kmh = target_speed_mps * 3.6
             control = controller.run_step(target_speed_kmh, target_transform)
+            max_steer = self._tactic_max_steer(plan)
+            if max_steer is not None:
+                control.steer = max(-max_steer, min(max_steer, control.steer))
             actor.apply_control(control)
         for name in completed:
             self.active.pop(name, None)
@@ -160,7 +227,8 @@ class AttackManager:
         if not plan.path_waypoints:
             return actor.get_transform()
         actor_loc = actor.get_transform().location
-        lookahead = float(self.config.get("lookahead_distance_m", 6.0))
+        tactic_cfg = self.config.get(plan.tactic, {}) if isinstance(self.config.get(plan.tactic, {}), dict) else {}
+        lookahead = float(tactic_cfg.get("lookahead_distance_m", self.config.get("lookahead_distance_m", 6.0)))
         start_idx = max(0, min(self.path_progress.get(plan.actor_name, 0), len(plan.path_waypoints) - 1))
         closest_idx = start_idx
         closest_dist = float("inf")
@@ -181,6 +249,15 @@ class AttackManager:
                 return transform
             prev_loc = transform.location
         return plan.path_waypoints[-1]
+
+    def _tactic_max_steer(self, plan: PlannedBehavior):
+        tactic_cfg = self.config.get(plan.tactic, {}) if isinstance(self.config.get(plan.tactic, {}), dict) else {}
+        if "max_steer" not in tactic_cfg:
+            return None
+        try:
+            return max(0.0, min(float(tactic_cfg["max_steer"]), float(self.config.get("pid_max_steering", 0.5))))
+        except (TypeError, ValueError):
+            return None
 
 
     def _recover_target_speed(self, actor, nominal_speed_mps: float, dt: float) -> float:

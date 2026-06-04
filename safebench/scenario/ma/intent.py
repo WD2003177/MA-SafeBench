@@ -31,6 +31,7 @@ SOFT_HINT_KEYS = ("style", "speed_band", "brake_style", "speed_delta_hint_mps", 
 CONTRACT_SOFT_KEYS = ("gap_band", "merge_timing")
 ROLE_BY_BEHAVIOR = {
     "gain_lead": ("Striker",),
+    "slot_sync": ("Striker",),
     "seal_escape": ("Blocker",),
     "cut_in": ("Striker",),
     "front_brake": ("Striker",),
@@ -134,7 +135,7 @@ class MAIntentCompiler:
         if contract is not None and not self._command_matches_contract(actor_name, role, tactic, contract):
             return None, {"status": "rejected", "reason": "command_contract_mismatch", "actor_name": actor_name, "role": role, "tactic": tactic, "contract_id": contract.contract_id}
         command_side = contract.pass_side if contract is not None else meta.side
-        if tactic in ("gain_lead", "cut_in") and command_side not in ("left", "right"):
+        if tactic in ("gain_lead", "slot_sync", "cut_in") and command_side not in ("left", "right"):
             return None, {"status": "rejected", "reason": "cut_in_requires_adjacent_side", "actor_name": actor_name, "side": meta.side}
         if tactic == "seal_escape" and meta.side != "ego_lane":
             return None, {"status": "rejected", "reason": "blocker_must_start_in_ego_lane", "actor_name": actor_name, "side": meta.side}
@@ -142,6 +143,10 @@ class MAIntentCompiler:
             seal_reason = self._seal_escape_unreachable_reason(actor, ego_vehicle)
             if seal_reason:
                 return None, {"status": "rejected", "reason": "seal_escape_requires_front_window", "unreachable_reason": seal_reason, "actor_name": actor_name}
+        if phase == "compress" and tactic in ("gain_lead", "slot_sync"):
+            gain_lead_reason = self._gain_lead_unreachable_reason(actor, ego_vehicle, actors, contract, tactic)
+            if gain_lead_reason:
+                return None, {"status": "rejected", "reason": "compress_striker_tactic_would_destroy_cut_in_slot", "unreachable_reason": gain_lead_reason, "actor_name": actor_name}
         if tactic == "front_brake":
             front_brake_reason = self._front_brake_unreachable_reason(actor, ego_vehicle)
             if front_brake_reason:
@@ -160,13 +165,22 @@ class MAIntentCompiler:
         if contract is not None:
             params["target_gap_m"] = float(contract.target_gap_m)
             params["merge_s_offset_m"] = float(contract.merge_s_offset_m)
+            params["phase"] = phase
             param_sources.update(contract.param_sources)
             soft_repairs.extend(contract.soft_hint_repairs)
+            if tactic == "seal_escape":
+                seal_cfg = self.planner_config.get("seal_escape", {})
+                blocker_bounds = seal_cfg.get("strike_gap_bounds_m", [10.0, 14.0]) if phase in ("strike", "cut_in_committed", "brake_pulse") else seal_cfg.get("compress_gap_bounds_m", [14.0, 20.0])
+                blocker_gap = float(params.get("lead_gap_hint_m", seal_cfg.get("target_gap_m", sum(blocker_bounds) / 2.0)))
+                blocker_gap = _clamp(blocker_gap, blocker_bounds)
+                params["target_gap_m"] = blocker_gap
+                params["lead_gap_hint_m"] = blocker_gap
+                param_sources["target_gap_m"] = "resolved_from_blocker_seal_gap"
         else:
             param_sources.setdefault("target_gap_m", "resolved_from_defaults")
             param_sources.setdefault("merge_s_offset_m", "resolved_from_defaults")
         if tactic == "cut_in":
-            cut_in_reason = self._cut_in_unreachable_reason(actor, ego_vehicle, command_side, params)
+            cut_in_reason = self._cut_in_unreachable_reason(actor, ego_vehicle, command_side, params, actors, contract)
             if cut_in_reason:
                 return None, {"status": "rejected", "reason": "cut_in_requires_adjacent_lane_and_window", "unreachable_reason": cut_in_reason, "actor_name": actor_name}
         constraints_cfg = self.planner_config.get("constraints", {})
@@ -187,7 +201,7 @@ class MAIntentCompiler:
         if tactic == "recover":
             target_actor = "none"
             target_actor_id = -1
-        target_lane_ref = "current_lane" if tactic in ("recover", "gain_lead") else "ego_lane"
+        target_lane_ref = "current_lane" if tactic in ("recover", "gain_lead", "slot_sync") else "ego_lane"
         return BehaviorIR(
             command_id=command_id,
             actor_name=actor_name,
@@ -291,9 +305,19 @@ class MAIntentCompiler:
         }
         contract_cfg = self.planner_config.get("contract", {})
         duration = float(raw.get("duration_s", contract_cfg.get("duration_s", 8.0)))
-        duration_bounds = contract_cfg.get("duration_bounds_s", [2.0, 12.0])
-        if duration < float(duration_bounds[0]) or duration > float(duration_bounds[1]):
-            return None, "contract_duration_out_of_bounds"
+        duration_bounds = contract_cfg.get("duration_bounds_s", [6.0, 12.0])
+        clamped_duration = _clamp(duration, duration_bounds)
+        if clamped_duration != duration:
+            soft_repairs.append({
+                "field": "duration_s",
+                "status": "clamped_contract_duration",
+                "not_directly_executed": True,
+                "resolved_by_verifier_planner": True,
+                "legacy_value": duration,
+                "resolved_value": clamped_duration,
+                "bounds": duration_bounds,
+            })
+            duration = clamped_duration
         lifecycle, reason = self._contract_lifecycle(raw, phase)
         if reason:
             return None, reason
@@ -414,7 +438,8 @@ class MAIntentCompiler:
     def _default_lifecycle(self, phase: str) -> Dict[str, List[str]]:
         advance_by_phase = {
             "compress": ["blocker_seal_success", "striker_cutin_window_ready"],
-            "strike": ["cutin_success"],
+            "strike": [],
+            "cut_in_committed": ["cutin_success"],
             "brake_pulse": [],
             "observe": [],
             "recover": [],
@@ -422,11 +447,13 @@ class MAIntentCompiler:
         return {
             "advance_if": advance_by_phase.get(phase, []),
             "abort_if": self._default_abort_events(phase),
-            "renegotiate_if": ["contract_timeout", "striker_window_lost", "blocker_seal_lost", "ego_lane_changed", "pass_side_blocked"],
+            "renegotiate_if": [] if phase == "cut_in_committed" else ["contract_timeout", "striker_window_lost", "blocker_seal_lost", "ego_lane_changed", "pass_side_blocked"],
         }
 
     def _default_abort_events(self, phase: str) -> List[str]:
         base = ["realism_violation", "teleport_detected", "attacker_offroad"]
+        if phase == "cut_in_committed":
+            return ["teleport_detected", "attacker_offroad", "cut_in_timeout"]
         if phase == "brake_pulse":
             return base + ["hard_brake", "near_miss"]
         return base
@@ -437,16 +464,16 @@ class MAIntentCompiler:
         if phase == "compress":
             return [
                 {"actor_name": contract.blocker_actor, "role": "Blocker", "tactic": "seal_escape", "target_actor": "ego", "hints": {"lead_gap_hint_m": 16.0}},
-                {"actor_name": contract.striker_actor, "role": "Striker", "tactic": "gain_lead", "target_actor": "ego", "hints": {}},
+                {"actor_name": contract.striker_actor, "role": "Striker", "tactic": "slot_sync", "target_actor": "ego", "hints": {"speed_band": "hold", "speed_delta_hint_mps": 0.0}},
             ]
-        if phase == "strike":
+        if phase in ("strike", "cut_in_committed"):
             return [
-                {"actor_name": contract.blocker_actor, "role": "Blocker", "tactic": "seal_escape", "target_actor": "ego", "hints": {"lead_gap_hint_m": 16.0}},
-                {"actor_name": contract.striker_actor, "role": "Striker", "tactic": "cut_in", "target_actor": "ego", "hints": {}},
+                {"actor_name": contract.blocker_actor, "role": "Blocker", "tactic": "seal_escape", "target_actor": "ego", "hints": {"lead_gap_hint_m": 12.0}},
+                {"actor_name": contract.striker_actor, "role": "Striker", "tactic": "cut_in", "target_actor": "ego", "hints": {"speed_band": "press"}},
             ]
         if phase == "brake_pulse":
             return [
-                {"actor_name": contract.blocker_actor, "role": "Blocker", "tactic": "seal_escape", "target_actor": "ego", "hints": {"lead_gap_hint_m": 16.0}},
+                {"actor_name": contract.blocker_actor, "role": "Blocker", "tactic": "seal_escape", "target_actor": "ego", "hints": {"lead_gap_hint_m": 12.0}},
                 {"actor_name": contract.striker_actor, "role": "Striker", "tactic": "front_brake", "target_actor": "ego", "hints": {}},
             ]
         return [{"actor_name": actor, "role": role, "tactic": "recover", "target_actor": "none", "hints": {}} for actor, role in ((contract.blocker_actor, "Blocker"), (contract.striker_actor, "Striker"))]
@@ -455,7 +482,7 @@ class MAIntentCompiler:
         if role == "Blocker":
             return actor_name == contract.blocker_actor and tactic in ("seal_escape", "recover")
         if role == "Striker":
-            return actor_name == contract.striker_actor and tactic in ("gain_lead", "cut_in", "front_brake", "recover")
+            return actor_name == contract.striker_actor and tactic in ("gain_lead", "slot_sync", "cut_in", "front_brake", "recover")
         return tactic == "recover"
 
     def _front_brake_unreachable_reason(self, actor, ego_vehicle) -> str:
@@ -498,7 +525,7 @@ class MAIntentCompiler:
             return "blocker_not_in_front_window"
         return ""
 
-    def _cut_in_unreachable_reason(self, actor, ego_vehicle, pass_side: str, params: Dict[str, Any]) -> str:
+    def _cut_in_unreachable_reason(self, actor, ego_vehicle, pass_side: str, params: Dict[str, Any], actors: Dict[str, Any], contract: MAContract = None) -> str:
         carla_map = CarlaDataProvider.get_map()
         actor_tf = actor.get_transform()
         ego_tf = ego_vehicle.get_transform()
@@ -516,23 +543,71 @@ class MAIntentCompiler:
             return "striker_not_adjacent"
         gap = self._relative_gap(ego_vehicle, actor)
         cfg = self.planner_config.get("cut_in", self.planner_config.get("cut_in_and_brake", {}))
-        bounds = cfg.get("target_gap_bounds_m", [4.0, 15.0])
+        bounds = cfg.get("start_gap_bounds_m", cfg.get("target_gap_bounds_m", [4.0, 15.0]))
         min_gap = float(bounds[0])
         max_gap = float(bounds[1])
-        hint_gap = float(params.get("target_gap_m", max_gap))
-        if gap > max(max_gap, hint_gap):
+        if gap > max_gap:
             return "striker_too_far"
         if gap < min_gap:
             return "front_brake_gap_invalid"
+        blocker = actors.get(contract.blocker_actor) if contract is not None else actors.get("blocker_1")
+        if blocker is None or not blocker.is_alive:
+            return "blocker_not_in_front_window"
+        blocker_gap = self._relative_gap(ego_vehicle, blocker)
+        min_clearance = float(cfg.get("min_blocker_clearance_m", 5.0))
+        slot_bounds = cfg.get("slot_gap_bounds_m", cfg.get("target_gap_bounds_m", [6.0, 9.0]))
+        desired_slot = _clamp(float(params.get("target_gap_m", cfg.get("desired_slot_gap_m", 7.0))), slot_bounds)
+        max_slot = blocker_gap - min_clearance
+        if max_slot < float(slot_bounds[0]):
+            return "blocker_clearance_too_small"
+        final_slot = _clamp(min(desired_slot, max_slot), slot_bounds)
+        ego_speed = float(CarlaDataProvider.get_velocity(ego_vehicle))
+        striker_speed = float(CarlaDataProvider.get_velocity(actor))
+        lead_in_s = float(cfg.get("lead_in_time_s", 0.6))
+        lane_change_min_duration = self._lane_change_min_duration(actor)
+        horizon = lead_in_s + lane_change_min_duration
+        predicted_gap = gap - max(0.0, ego_speed - striker_speed) * horizon
+        predicted_bounds = cfg.get("predicted_slot_gap_bounds_m", [6.0, 9.0])
+        tolerance = float(cfg.get("predicted_slot_tolerance_m", 2.0))
+        predicted_in_bounds = float(predicted_bounds[0]) <= predicted_gap <= float(predicted_bounds[1])
+        predicted_close_to_final = abs(predicted_gap - final_slot) <= tolerance
+        if not predicted_in_bounds and not predicted_close_to_final:
+            return "predicted_slot_gap_invalid"
+        params["predicted_cutin_gap_m"] = predicted_gap
+        params["desired_slot_gap_m"] = desired_slot
+        params["final_slot_gap_m"] = final_slot
+        params["predicted_slot_gap_m"] = predicted_gap
+        params["predicted_slot_gap_bounds_m"] = [float(predicted_bounds[0]), float(predicted_bounds[1])]
+        params["predicted_slot_gap_in_bounds"] = predicted_in_bounds
+        params["predicted_slot_gap_close_to_final"] = predicted_close_to_final
         route_remaining = self._route_remaining_distance(actor)
         if route_remaining < float(cfg.get("min_route_remaining_m", 20.0)):
             return "route_remaining_too_short"
         lane_width = max(float(actor_wp.lane_width), 3.0)
         constraints_cfg = self.planner_config.get("constraints", {})
         max_lat = float(constraints_cfg.get("max_lateral_accel_mps2", 3.5))
-        lane_change_min_duration = (6.0 * lane_width / max(max_lat, 1e-3)) ** 0.5
+        lane_change_min_duration = (6.0 * lane_width / max(max_lat, 1e-3)) ** 0.5 * max(1.0, float(cfg.get("lane_change_safety_factor", 1.0)))
         if lane_change_min_duration > float(cfg.get("max_lane_change_duration_s", cfg.get("lane_change_duration_bounds_s", [2.0, 5.0])[1])):
             return "lane_change_duration_too_long"
+        return ""
+
+    def _gain_lead_unreachable_reason(self, actor, ego_vehicle, actors: Dict[str, Any], contract: MAContract = None, tactic: str = "gain_lead") -> str:
+        blocker = actors.get(contract.blocker_actor) if contract is not None else actors.get("blocker_1")
+        if blocker is None or not blocker.is_alive:
+            return ""
+        cfg = self.planner_config.get("cut_in", self.planner_config.get("cut_in_and_brake", {}))
+        striker_gap = self._relative_gap(ego_vehicle, actor)
+        blocker_gap = self._relative_gap(ego_vehicle, blocker)
+        min_clearance = float(cfg.get("min_blocker_clearance_m", 5.0))
+        if striker_gap >= blocker_gap:
+            return "striker_ahead_of_blocker_no_slot"
+        if blocker_gap - striker_gap < min_clearance:
+            return "blocker_clearance_too_small"
+        slot_bounds = cfg.get("slot_gap_bounds_m", cfg.get("target_gap_bounds_m", [6.0, 9.0]))
+        if tactic == "gain_lead" and float(slot_bounds[0]) <= striker_gap <= float(slot_bounds[1]):
+            return "striker_already_in_cut_in_slot"
+        if tactic == "gain_lead" and striker_gap > float(slot_bounds[1]):
+            return "striker_ahead_of_slot_needs_slot_sync"
         return ""
 
     def _params_for_behavior(self, behavior: str, hints: Dict[str, Any], meta: MAActorMeta) -> Tuple[Dict[str, Any], List[str], List[Dict[str, Any]]]:
@@ -586,7 +661,7 @@ class MAIntentCompiler:
             params.setdefault("normal_speed_mps", meta.normal_speed_mps)
             params.setdefault("duration_s", 3.0)
             params.setdefault("max_decel_mps2", -2.0)
-        if behavior == "gain_lead":
+        if behavior in ("gain_lead", "slot_sync"):
             params.setdefault("duration_s", params.get("duration_s", 3.0))
         if behavior == "cut_in":
             params.setdefault("duration_s", params.get("lane_change_duration_s", 2.5) + params.get("hold_after_merge_s", 0.5) + params.get("post_brake_duration_s", 1.0))
@@ -598,10 +673,11 @@ class MAIntentCompiler:
 
     def _lead_gap_hint_bounds(self, role: str, behavior: str) -> List[float]:
         if role == "Blocker" and behavior == "seal_escape":
-            return [8.0, 25.0]
+            bounds = self.planner_config.get("seal_escape", {}).get("target_gap_bounds_m", [24.0, 34.0])
+            return [float(bounds[0]), float(bounds[1])]
         if role == "Striker" and behavior == "front_brake":
             return [1.0, 8.0]
-        if role == "Striker" and behavior in ("gain_lead", "cut_in"):
+        if role == "Striker" and behavior in ("gain_lead", "slot_sync", "cut_in"):
             return [0.8, 6.0]
         return [0.8, 25.0]
 
@@ -614,4 +690,6 @@ class MAIntentCompiler:
             return [-1.0, 2.0]
         if behavior == "gain_lead":
             return [-2.0, 4.0]
+        if behavior == "slot_sync":
+            return [-2.0, 2.0]
         return [-2.0, 2.0]

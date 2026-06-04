@@ -43,7 +43,6 @@ if __name__ == '__main__':
     parser.add_argument('--frame_skip', '-fs', type=int, default=1, help='skip of frame in each step')
     parser.add_argument('--port', type=int, default=2000, help='port to communicate with carla')
     parser.add_argument('--tm_port', type=int, default=8000, help='traffic manager port')
-    parser.add_argument('--carla_timeout_s', type=float, default=60.0, help='CARLA client RPC timeout in seconds')
     parser.add_argument('--fixed_delta_seconds', type=float, default=0.1)
     args = parser.parse_args()
     args_dict = vars(args)
