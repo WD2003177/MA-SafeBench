@@ -27,13 +27,18 @@ def cal_out_of_road_length(sequence):
 
 
 def cal_avg_yaw_velocity(sequence):
+    if len(sequence) < 2:
+        return 0.0
     total_yaw_change = 0
     for i, time_stamp in enumerate(sequence):
         if i == 0:
             continue
         total_yaw_change += abs(sequence[i]['ego_yaw'] - sequence[i - 1]['ego_yaw'])
     total_yaw_change = total_yaw_change / 180 * math.pi
-    avg_yaw_velocity = total_yaw_change / (sequence[-1]['current_game_time'] - sequence[0]['current_game_time'])
+    duration = sequence[-1]['current_game_time'] - sequence[0]['current_game_time']
+    if duration <= 0:
+        return 0.0
+    avg_yaw_velocity = total_yaw_change / duration
 
     return avg_yaw_velocity
 

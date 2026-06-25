@@ -9,7 +9,11 @@ from safebench.scenario.scenario_manager.carla_data_provider import CarlaDataPro
 
 
 def _speed(actor) -> float:
-    return float(CarlaDataProvider.get_velocity(actor))
+    try:
+        velocity = actor.get_velocity()
+        return float(math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2))
+    except Exception:
+        return float(CarlaDataProvider.get_velocity(actor))
 
 
 def _distance(a, b) -> float:
@@ -44,6 +48,8 @@ class MARiskMetrics:
         self.prev_ego_accel = None
         self.prev_actor_locations = {}
         self.prev_actor_accels = {}
+        self.prev_actor_lateral_accels = {}
+        self.prev_actor_curvatures = {}
         self.prev_active_commands = {}
         self.episode_min_ttc = float("inf")
         self.episode_min_distance = float("inf")
@@ -56,6 +62,10 @@ class MARiskMetrics:
         self.episode_attacker_max_abs_accel = 0.0
         self.episode_attacker_max_abs_jerk = 0.0
         self.episode_attacker_max_lateral_accel = 0.0
+        self.episode_attacker_max_abs_lateral_jerk = 0.0
+        self.episode_attacker_max_abs_curvature = 0.0
+        self.episode_attacker_max_abs_curvature_rate_s = 0.0
+        self.episode_attacker_max_abs_curvature_rate_t = 0.0
         self.episode_realism_violation_count = 0
         self.episode_cutin_success = False
         self.episode_hard_brake = False
@@ -68,6 +78,14 @@ class MARiskMetrics:
     def update(self, ego_vehicle, actors: Dict[str, Any], active_behaviors: Dict[str, str], sim_time_s: float, dt: float, active_plan_meta: Dict[str, Dict[str, Any]] = None) -> Dict[str, Any]:
         dt = max(float(dt), 1e-3)
         active_plan_meta = active_plan_meta or {}
+        self._active_plan_meta = active_plan_meta
+        self._current_sim_time_s = float(sim_time_s)
+        attack_active = any(
+            isinstance(meta, dict)
+            and bool(meta.get("attack_executable"))
+            and meta.get("tactic") in ("cut_in", "front_brake")
+            for meta in active_plan_meta.values()
+        )
         ego_speed = _speed(ego_vehicle)
         ego_accel = 0.0 if self.prev_ego_speed is None else (ego_speed - self.prev_ego_speed) / dt
         ego_jerk = 0.0 if self.prev_ego_accel is None else (ego_accel - self.prev_ego_accel) / dt
@@ -106,9 +124,10 @@ class MARiskMetrics:
                 command_id = "%s:%s" % (name, active_behaviors.get(name))
             command_changed = command_id is not None and command_id != self.prev_active_commands.get(name)
             self._update_actor_realism(name, actor, wp, dt, warmup_excluded=bool(command_changed), command_id=command_id)
+            plan_attack_executable = bool(plan_meta.get("attack_executable")) if isinstance(plan_meta, dict) else False
             if ego_wp is not None and wp is not None and wp.road_id == ego_wp.road_id and wp.lane_id == ego_wp.lane_id and 0.0 < rel_gap <= self.cutin_gap_m:
                 if active_behaviors.get(name) in ("cut_in", "cut_in_and_brake"):
-                    step_cutin_success = True
+                    step_cutin_success = step_cutin_success or plan_attack_executable
             loc = actor.get_transform().location
             prev = self.prev_actor_locations.get(name)
             if prev is not None:
@@ -130,8 +149,10 @@ class MARiskMetrics:
         if step_min_ttc == float("inf"):
             step_min_ttc = -1.0
 
-        step_hard_brake = ego_accel <= self.hard_brake_decel_mps2
-        step_near_miss = (step_min_ttc >= 0.0 and step_min_ttc <= self.near_miss_ttc_s) or (step_min_distance >= 0.0 and step_min_distance <= self.near_miss_distance_m)
+        raw_step_hard_brake = ego_accel <= self.hard_brake_decel_mps2
+        raw_step_near_miss = (step_min_ttc >= 0.0 and step_min_ttc <= self.near_miss_ttc_s) or (step_min_distance >= 0.0 and step_min_distance <= self.near_miss_distance_m)
+        step_hard_brake = raw_step_hard_brake and attack_active
+        step_near_miss = raw_step_near_miss and attack_active
         violation = step_offroad or step_teleport or self._step_realism_violation
         if violation:
             self.episode_realism_violation_count += 1
@@ -163,6 +184,8 @@ class MARiskMetrics:
             "ma_event_cutin_success": step_cutin_success,
             "ma_event_hard_brake": step_hard_brake,
             "ma_event_near_miss": step_near_miss,
+            "ma_event_hard_brake_raw": raw_step_hard_brake,
+            "ma_event_near_miss_raw": raw_step_near_miss,
             "ma_event_realism_valid_attack": (step_cutin_success or step_hard_brake or step_near_miss) and not violation,
             "ma_actor_realism_raw": dict(self.step_actor_realism_raw),
         }
@@ -181,18 +204,48 @@ class MARiskMetrics:
             prev_accel = self.prev_actor_accels.get(name)
             jerk = 0.0 if prev_accel is None else (lon_accel - prev_accel) / max(dt, 1e-3)
             self.prev_actor_accels[name] = lon_accel
+            prev_lateral_accel = self.prev_actor_lateral_accels.get(name)
+            lateral_jerk = 0.0 if prev_lateral_accel is None else (lat_accel - prev_lateral_accel) / max(dt, 1e-3)
+            self.prev_actor_lateral_accels[name] = lat_accel
+            speed = _speed(actor)
+            angular_velocity = actor.get_angular_velocity()
+            yaw_rate_radps = math.radians(float(angular_velocity.z))
+            curvature = yaw_rate_radps / speed if speed >= 0.5 else 0.0
+            prev_curvature = self.prev_actor_curvatures.get(name)
+            curvature_rate_t = 0.0 if prev_curvature is None else (curvature - prev_curvature) / max(dt, 1e-3)
+            curvature_rate_s = curvature_rate_t / speed if speed >= 0.5 else 0.0
+            self.prev_actor_curvatures[name] = curvature
             self.step_actor_realism_raw[name] = {
                 "command_id": command_id or "",
                 "raw_longitudinal_accel_mps2": float(lon_accel),
                 "raw_lateral_accel_mps2": float(lat_accel),
                 "raw_longitudinal_jerk_mps3": float(jerk),
+                "raw_lateral_jerk_mps3": float(lateral_jerk),
+                "raw_curvature": float(curvature),
+                "raw_curvature_rate_s": float(curvature_rate_s),
+                "raw_curvature_rate_t": float(curvature_rate_t),
+                "raw_normalized_steer": float(actor.get_control().steer),
                 "warmup_excluded": bool(warmup_excluded),
             }
+            plan_meta = getattr(self, "_active_plan_meta", {}).get(name, {})
+            shield = plan_meta.get("shield", {}) if isinstance(plan_meta, dict) else {}
+            self.step_actor_realism_raw[name].update({
+                "filtered_longitudinal_accel_mps2": float(shield.get("filtered_longitudinal_accel_mps2", lon_accel)),
+                "filtered_lateral_accel_mps2": float(shield.get("filtered_lateral_accel_mps2", lat_accel)),
+                "filtered_longitudinal_jerk_mps3": float(shield.get("filtered_longitudinal_jerk_mps3", jerk)),
+                "filtered_lateral_jerk_mps3": float(shield.get("filtered_lateral_jerk_mps3", lateral_jerk)),
+                "shield_intervention": bool(shield.get("intervention", False)),
+                "shield_replan_requested": abs(float(shield.get("last_replan_s", -1e9)) - self._current_sim_time_s) <= dt,
+            })
             if not warmup_excluded:
                 self.episode_attacker_max_abs_accel = max(self.episode_attacker_max_abs_accel, abs(lon_accel))
             if not warmup_excluded:
                 self.episode_attacker_max_abs_jerk = max(self.episode_attacker_max_abs_jerk, abs(jerk))
                 self.episode_attacker_max_lateral_accel = max(self.episode_attacker_max_lateral_accel, abs(lat_accel))
+                self.episode_attacker_max_abs_lateral_jerk = max(self.episode_attacker_max_abs_lateral_jerk, abs(lateral_jerk))
+                self.episode_attacker_max_abs_curvature = max(self.episode_attacker_max_abs_curvature, abs(curvature))
+                self.episode_attacker_max_abs_curvature_rate_s = max(self.episode_attacker_max_abs_curvature_rate_s, abs(curvature_rate_s))
+                self.episode_attacker_max_abs_curvature_rate_t = max(self.episode_attacker_max_abs_curvature_rate_t, abs(curvature_rate_t))
             violation = False
             if abs(lon_accel) > self.max_abs_accel:
                 self._add_realism_reason(name, "longitudinal_accel", abs(lon_accel), self.max_abs_accel, warmup_excluded=warmup_excluded, raw_measured=abs(lon_accel))
@@ -244,6 +297,10 @@ class MARiskMetrics:
             "ma_episode_attacker_max_abs_accel": self.episode_attacker_max_abs_accel,
             "ma_episode_attacker_max_abs_jerk": self.episode_attacker_max_abs_jerk,
             "ma_episode_attacker_max_lateral_accel": self.episode_attacker_max_lateral_accel,
+            "ma_episode_attacker_max_abs_lateral_jerk": self.episode_attacker_max_abs_lateral_jerk,
+            "ma_episode_attacker_max_abs_curvature": self.episode_attacker_max_abs_curvature,
+            "ma_episode_attacker_max_abs_curvature_rate_s": self.episode_attacker_max_abs_curvature_rate_s,
+            "ma_episode_attacker_max_abs_curvature_rate_t": self.episode_attacker_max_abs_curvature_rate_t,
             "ma_episode_realism_violation_count": self.episode_realism_violation_count,
             "ma_episode_cutin_success": self.episode_cutin_success,
             "ma_episode_hard_brake": self.episode_hard_brake,
@@ -256,3 +313,6 @@ class MARiskMetrics:
 
     def realism_violation_reasons(self):
         return list(self.last_realism_violation_reasons)
+
+
+CutInMetrics = MARiskMetrics

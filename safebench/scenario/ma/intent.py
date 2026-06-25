@@ -1,22 +1,14 @@
 from __future__ import annotations
 
 import itertools
+import math
 from typing import Any, Dict, List, Tuple
 
 import carla
 
 from safebench.scenario.ma.data_types import (
     ALLOWED_BEHAVIORS,
-    ALLOWED_BLOCKER_OBJECTIVES,
-    ALLOWED_ADVANCE_EVENTS,
-    ALLOWED_ABORT_EVENTS,
-    ALLOWED_RENEGOTIATE_EVENTS,
-    ALLOWED_PHASES,
-    ALLOWED_PASS_SIDES,
-    ALLOWED_STRIKER_OBJECTIVES,
-    ALLOWED_TACTICS,
     LEGACY_BEHAVIOR_TO_TACTIC,
-    PHASE_ALLOWED_TACTICS,
     BehaviorIR,
     DynamicsConstraints,
     MAContract,
@@ -26,17 +18,29 @@ from safebench.scenario.scenario_manager.carla_data_provider import CarlaDataPro
 
 
 FORBIDDEN_COMMAND_KEYS = ("throttle", "steer", "brake", "control", "waypoints", "path_waypoints", "speed_profile", "trajectory")
-SENSITIVE_PHYSICAL_HINT_KEYS = ("target_speed_mps", "brake_decel_mps2", "lane_change_duration_s")
-SOFT_HINT_KEYS = ("style", "speed_band", "brake_style", "speed_delta_hint_mps", "lead_gap_hint_m", "hold_cycles")
+SENSITIVE_PHYSICAL_HINT_KEYS = (
+    "target_speed_mps",
+    "brake_decel_mps2",
+    "lane_change_duration_s",
+    "speed_delta_hint_mps",
+    "lead_gap_hint_m",
+)
+SOFT_HINT_KEYS = ("style", "speed_band", "brake_style", "hold_cycles")
 CONTRACT_SOFT_KEYS = ("gap_band", "merge_timing")
-ROLE_BY_BEHAVIOR = {
-    "gain_lead": ("Striker",),
-    "slot_sync": ("Striker",),
-    "seal_escape": ("Blocker",),
-    "cut_in": ("Striker",),
-    "front_brake": ("Striker",),
-    "recover": ("Striker", "Blocker", "Recover"),
-}
+
+
+def _speed_mps(actor) -> float:
+    try:
+        velocity = actor.get_velocity()
+        return float(math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2))
+    except Exception:
+        return float(CarlaDataProvider.get_velocity(actor))
+
+
+def _default_template_spec() -> Dict[str, Any]:
+    from safebench.scenario.ma.templates.registry import get_template
+
+    return get_template("cut_in").spec_dict()
 
 
 def _clamp(value: float, bounds: List[float]) -> float:
@@ -51,8 +55,39 @@ def _safe_float(value: Any, default: float) -> float:
 
 
 class MAIntentCompiler:
-    def __init__(self, planner_config: Dict[str, Any]):
+    def __init__(self, planner_config: Dict[str, Any], template_spec: Dict[str, Any] = None):
         self.planner_config = planner_config
+        self.template_spec = template_spec or _default_template_spec()
+        self.template_id = self.template_spec.get("template_id", "cut_in")
+        phase_allowed_tactics = self.template_spec.get("phase_allowed_tactics", {})
+        self.allowed_phases = tuple(self.template_spec.get("phases", ()))
+        self.allowed_tactics = tuple(sorted({tactic for tactics in phase_allowed_tactics.values() for tactic in tactics}))
+        self.phase_allowed_tactics = {
+            phase: tuple(tactics)
+            for phase, tactics in phase_allowed_tactics.items()
+        }
+        self.role_allowed_tactics = {
+            role: {phase: tuple(tactics) for phase, tactics in phase_map.items()}
+            for role, phase_map in self.template_spec.get("role_allowed_tactics", {}).items()
+        }
+        contract_events = self.template_spec.get("contract_events", {})
+        self.allowed_advance_events = tuple(contract_events.get("advance_if", ()))
+        self.allowed_abort_events = tuple(contract_events.get("abort_if", ()))
+        self.allowed_renegotiate_events = tuple(contract_events.get("renegotiate_if", ()))
+        self.required_contract_phases = set(self.template_spec.get("required_contract_phases", ()))
+        contract_properties = self.template_spec.get("contract_schema", {}).get("properties", {})
+        self.allowed_pass_sides = tuple(contract_properties.get("pass_side", {}).get("enum", ()))
+        self.allowed_blocker_objectives = tuple(contract_properties.get("blocker_objective", {}).get("enum", ()))
+        self.allowed_striker_objectives = tuple(contract_properties.get("striker_objective", {}).get("enum", ()))
+        self.contract_defaults = self.template_spec.get("contract_defaults", {})
+        self.contract_command_templates = self.template_spec.get("contract_command_templates", {})
+        self.contract_command_match = self.template_spec.get("contract_command_match", {})
+        self.contract_lifecycle_defaults = self.template_spec.get("contract_lifecycle_defaults", {})
+        self.verifier_rules = self.template_spec.get("verifier_rules", {})
+        self.command_verifier_rules = tuple(self.verifier_rules.get("command", ()))
+        self.contract_verifier_rules = self.verifier_rules.get("contract", {})
+        self.target_lane_ref_by_tactic = self.template_spec.get("target_lane_ref_by_tactic", {})
+        self.soft_hint_bounds = self.template_spec.get("soft_hint_bounds", {})
         self._ids = itertools.count(1)
 
     def compile(
@@ -68,7 +103,7 @@ class MAIntentCompiler:
         if not isinstance(proposal, dict):
             return [], [{"status": "rejected", "reason": "proposal_not_dict"}], active_contract, {"event": "contract_unchanged"}
         phase = proposal.get("phase", "observe")
-        if phase not in ALLOWED_PHASES:
+        if phase not in self.allowed_phases:
             rejected.append({"status": "rejected", "reason": "invalid_phase", "phase": phase})
             phase = "recover"
         contract, contract_event = self._resolve_contract(proposal, phase, ego_vehicle, actors, metadata, sim_time_s, active_contract)
@@ -84,7 +119,7 @@ class MAIntentCompiler:
         if phase == "observe" and commands:
             rejected.append({"status": "rejected", "reason": "observe_commands_not_allowed"})
             return [], rejected, contract, contract_event
-        if phase not in ("observe", "recover") and contract is None:
+        if phase in self.required_contract_phases and contract is None:
             rejected.append({"status": "rejected", "reason": "missing_locked_contract", "phase": phase})
             return [], rejected, contract, contract_event
         if not commands and contract is not None:
@@ -104,7 +139,7 @@ class MAIntentCompiler:
     def _compile_one(self, raw: Dict[str, Any], phase: str, ego_vehicle, actors: Dict[str, Any], metadata: Dict[str, MAActorMeta], sim_time_s: float, contract: MAContract = None):
         if not isinstance(raw, dict):
             return None, {"status": "rejected", "reason": "command_not_dict"}
-        actor_name = raw.get("actor_name")
+        actor_name = self._actor_name_from_command(raw)
         behavior = raw.get("behavior")
         tactic = raw.get("tactic") or LEGACY_BEHAVIOR_TO_TACTIC.get(behavior, behavior)
         forbidden = [key for key in FORBIDDEN_COMMAND_KEYS if key in raw]
@@ -112,11 +147,11 @@ class MAIntentCompiler:
             return None, {"status": "rejected", "reason": "llm_output_contains_low_level_control_or_trajectory", "keys": forbidden, "actor_name": actor_name}
         if behavior == "no_op":
             return None, {"status": "rejected", "reason": "no_op_is_not_a_primitive", "actor_name": actor_name}
-        if tactic not in ALLOWED_TACTICS:
+        if tactic not in self.allowed_tactics:
             return None, {"status": "rejected", "reason": "invalid_tactic", "tactic": tactic, "behavior": behavior}
-        if behavior is not None and behavior not in ALLOWED_BEHAVIORS:
+        if behavior is not None and behavior not in ALLOWED_BEHAVIORS and behavior not in self.allowed_tactics:
             return None, {"status": "rejected", "reason": "invalid_behavior", "behavior": behavior}
-        if tactic not in PHASE_ALLOWED_TACTICS.get(phase, tuple()):
+        if tactic not in self.phase_allowed_tactics.get(phase, tuple()):
             return None, {"status": "rejected", "reason": "phase_tactic_mismatch", "phase": phase, "tactic": tactic, "actor_name": actor_name}
         actor = actors.get(actor_name)
         if actor is None:
@@ -130,33 +165,37 @@ class MAIntentCompiler:
         if actor_wp is None:
             return None, {"status": "rejected", "reason": "actor_not_on_driving_lane", "actor_name": actor_name}
         role = raw.get("role") or meta.role_hint
-        if role not in ROLE_BY_BEHAVIOR.get(tactic, (role,)):
+        role_phase_tactics = self.role_allowed_tactics.get(role, {}).get(phase)
+        if role_phase_tactics is not None and tactic not in role_phase_tactics:
             return None, {"status": "rejected", "reason": "role_tactic_mismatch", "actor_name": actor_name, "role": role, "tactic": tactic}
-        if contract is not None and not self._command_matches_contract(actor_name, role, tactic, contract):
+        if contract is not None and self.contract_command_match and not self._command_matches_contract(actor_name, role, tactic, contract):
             return None, {"status": "rejected", "reason": "command_contract_mismatch", "actor_name": actor_name, "role": role, "tactic": tactic, "contract_id": contract.contract_id}
         command_side = contract.pass_side if contract is not None else meta.side
-        if tactic in ("gain_lead", "slot_sync", "cut_in") and command_side not in ("left", "right"):
-            return None, {"status": "rejected", "reason": "cut_in_requires_adjacent_side", "actor_name": actor_name, "side": meta.side}
-        if tactic == "seal_escape" and meta.side != "ego_lane":
-            return None, {"status": "rejected", "reason": "blocker_must_start_in_ego_lane", "actor_name": actor_name, "side": meta.side}
-        if tactic == "seal_escape":
-            seal_reason = self._seal_escape_unreachable_reason(actor, ego_vehicle)
-            if seal_reason:
-                return None, {"status": "rejected", "reason": "seal_escape_requires_front_window", "unreachable_reason": seal_reason, "actor_name": actor_name}
-        if phase == "compress" and tactic in ("gain_lead", "slot_sync"):
-            gain_lead_reason = self._gain_lead_unreachable_reason(actor, ego_vehicle, actors, contract, tactic)
-            if gain_lead_reason:
-                return None, {"status": "rejected", "reason": "compress_striker_tactic_would_destroy_cut_in_slot", "unreachable_reason": gain_lead_reason, "actor_name": actor_name}
-        if tactic == "front_brake":
-            front_brake_reason = self._front_brake_unreachable_reason(actor, ego_vehicle)
-            if front_brake_reason:
-                return None, {"status": "rejected", "reason": "front_brake_requires_stable_same_lane_gap", "unreachable_reason": front_brake_reason, "actor_name": actor_name}
+        if tactic == "seal_escape" and meta.side in ("left", "right"):
+            command_side = meta.side
+        rule_rejection = self._command_verifier_rejection(
+            when="before_params",
+            phase=phase,
+            tactic=tactic,
+            actor_name=actor_name,
+            actor=actor,
+            ego_vehicle=ego_vehicle,
+            actors=actors,
+            meta=meta,
+            command_side=command_side,
+            contract=contract,
+        )
+        if rule_rejection:
+            return None, rule_rejection
 
-        hints = raw.get("hints", {}) if isinstance(raw.get("hints", {}), dict) else {}
+        hints = dict(raw.get("hints", {})) if isinstance(raw.get("hints", {}), dict) else {}
+        if raw.get("style") and "style" not in hints:
+            hints["style"] = raw.get("style")
         forbidden_hints = [key for key in FORBIDDEN_COMMAND_KEYS if key in hints]
         if forbidden_hints:
             return None, {"status": "rejected", "reason": "llm_hint_contains_low_level_control_or_trajectory", "keys": forbidden_hints, "actor_name": actor_name}
         params, repair_notes, soft_repairs = self._params_for_behavior(tactic, hints, meta)
+        params["phase"] = phase
         param_sources = {
             "target_speed_mps": "planner_runtime",
             "brake_decel_mps2": "planner_runtime",
@@ -165,24 +204,41 @@ class MAIntentCompiler:
         if contract is not None:
             params["target_gap_m"] = float(contract.target_gap_m)
             params["merge_s_offset_m"] = float(contract.merge_s_offset_m)
-            params["phase"] = phase
             param_sources.update(contract.param_sources)
             soft_repairs.extend(contract.soft_hint_repairs)
             if tactic == "seal_escape":
                 seal_cfg = self.planner_config.get("seal_escape", {})
-                blocker_bounds = seal_cfg.get("strike_gap_bounds_m", [10.0, 14.0]) if phase in ("strike", "cut_in_committed", "brake_pulse") else seal_cfg.get("compress_gap_bounds_m", [14.0, 20.0])
-                blocker_gap = float(params.get("lead_gap_hint_m", seal_cfg.get("target_gap_m", sum(blocker_bounds) / 2.0)))
+                if meta.side in ("left", "right"):
+                    blocker_bounds = seal_cfg.get("escape_gap_bounds_m", [-2.0, 6.0])
+                    params["escape_blocking"] = True
+                    params["block_escape_side"] = meta.side
+                else:
+                    blocker_bounds = seal_cfg.get("strike_gap_bounds_m", [10.0, 14.0]) if phase in ("strike", "cut_in_committed", "brake_pulse") else seal_cfg.get("compress_gap_bounds_m", [14.0, 20.0])
+                blocker_gap = float(params.get(
+                    "lead_gap_hint_m",
+                    seal_cfg.get("escape_target_gap_m" if meta.side in ("left", "right") else "target_gap_m", sum(blocker_bounds) / 2.0),
+                ))
                 blocker_gap = _clamp(blocker_gap, blocker_bounds)
                 params["target_gap_m"] = blocker_gap
-                params["lead_gap_hint_m"] = blocker_gap
-                param_sources["target_gap_m"] = "resolved_from_blocker_seal_gap"
+                param_sources["target_gap_m"] = "resolved_from_escape_block_gap" if meta.side in ("left", "right") else "resolved_from_blocker_seal_gap"
         else:
             param_sources.setdefault("target_gap_m", "resolved_from_defaults")
             param_sources.setdefault("merge_s_offset_m", "resolved_from_defaults")
-        if tactic == "cut_in":
-            cut_in_reason = self._cut_in_unreachable_reason(actor, ego_vehicle, command_side, params, actors, contract)
-            if cut_in_reason:
-                return None, {"status": "rejected", "reason": "cut_in_requires_adjacent_lane_and_window", "unreachable_reason": cut_in_reason, "actor_name": actor_name}
+        rule_rejection = self._command_verifier_rejection(
+            when="after_params",
+            phase=phase,
+            tactic=tactic,
+            actor_name=actor_name,
+            actor=actor,
+            ego_vehicle=ego_vehicle,
+            actors=actors,
+            meta=meta,
+            command_side=command_side,
+            contract=contract,
+            params=params,
+        )
+        if rule_rejection:
+            return None, rule_rejection
         constraints_cfg = self.planner_config.get("constraints", {})
         constraints = DynamicsConstraints(
             max_abs_longitudinal_accel_mps2=float(constraints_cfg.get("max_abs_longitudinal_accel_mps2", 6.0)),
@@ -195,13 +251,15 @@ class MAIntentCompiler:
         max_horizon = float(self.planner_config.get("max_plan_horizon_s", 6.0))
         max_duration = _clamp(float(params.get("duration_s", max_horizon)), [min_duration, max_horizon])
         target_actor = raw.get("target_actor", "ego")
+        if tactic != "recover" and target_actor == actor_name:
+            target_actor = "ego"
         if tactic != "recover" and target_actor != "ego" and target_actor not in actors:
             return None, {"status": "rejected", "reason": "unknown_target_actor", "actor_name": actor_name, "target_actor": target_actor}
         target_actor_id = ego_vehicle.id if target_actor == "ego" else (actors[target_actor].id if target_actor in actors else -1)
         if tactic == "recover":
             target_actor = "none"
             target_actor_id = -1
-        target_lane_ref = "current_lane" if tactic in ("recover", "gain_lead", "slot_sync") else "ego_lane"
+        target_lane_ref = self.target_lane_ref_by_tactic.get(tactic, "current_lane")
         return BehaviorIR(
             command_id=command_id,
             actor_name=actor_name,
@@ -230,6 +288,15 @@ class MAIntentCompiler:
             repair_notes=repair_notes,
         ), {"status": "accepted"}
 
+    def _actor_name_from_command(self, raw: Dict[str, Any]) -> str:
+        candidate = raw.get("actor_name") or raw.get("agent") or raw.get("sender")
+        if candidate is None:
+            return candidate
+        spec = self.template_spec.get("command_normalization_roles", {}).get(str(candidate).lower())
+        if isinstance(spec, dict) and spec.get("actor_name"):
+            return spec.get("actor_name")
+        return candidate
+
     def _resolve_contract(self, proposal: Dict[str, Any], phase: str, ego_vehicle, actors: Dict[str, Any], metadata: Dict[str, MAActorMeta], sim_time_s: float, active_contract: MAContract):
         if phase == "recover":
             if active_contract is not None:
@@ -240,10 +307,14 @@ class MAIntentCompiler:
                 event.update({"status": "rejected", "details": "recover_contract_not_allowed"})
             return None, event
         raw_contract = proposal.get("contract")
-        if raw_contract is None and active_contract is not None:
+        if active_contract is not None:
             if active_contract.active(sim_time_s):
-                active_contract.phase = phase
-                return active_contract, {"event": "contract_active", "contract_id": active_contract.contract_id}
+                event = {"event": "contract_active", "contract_id": active_contract.contract_id}
+                if phase != active_contract.phase:
+                    event["phase_proposal_status"] = "ignored_until_lifecycle_event"
+                if raw_contract is not None:
+                    event["proposal_status"] = "ignored_while_contract_locked"
+                return active_contract, event
             active_contract.locked = False
             active_contract.renegotiate_reason = "contract_timeout"
             return None, {"status": "rejected", "event": "contract_failed", "reason": "contract_timeout", "contract_id": active_contract.contract_id}
@@ -258,25 +329,39 @@ class MAIntentCompiler:
 
     def _build_contract(self, raw: Dict[str, Any], phase: str, ego_vehicle, actors: Dict[str, Any], metadata: Dict[str, MAActorMeta], sim_time_s: float):
         pass_side = str(raw.get("pass_side", "") or "").lower()
-        if pass_side not in ALLOWED_PASS_SIDES:
-            return None, "invalid_pass_side"
-        blocker_actor = raw.get("blocker_actor", "blocker_1")
-        striker_actor = raw.get("striker_actor", "attacker_1")
+        blocker_actor = raw.get("blocker_actor", self.contract_defaults.get("blocker_actor", ""))
+        striker_actor = raw.get("striker_actor", self.contract_defaults.get("striker_actor", ""))
         if blocker_actor not in actors or striker_actor not in actors:
             return None, "unknown_contract_actor"
         blocker_meta = metadata.get(blocker_actor)
         striker_meta = metadata.get(striker_actor)
         if blocker_meta is None or striker_meta is None:
             return None, "missing_contract_actor_metadata"
-        if blocker_meta.role_hint != "Blocker" or striker_meta.role_hint != "Striker":
+        expected_blocker_role = self.contract_defaults.get("blocker_role")
+        expected_striker_role = self.contract_defaults.get("striker_role")
+        if expected_blocker_role and blocker_meta.role_hint != expected_blocker_role:
             return None, "contract_role_mismatch"
-        if striker_meta.side != pass_side:
-            return None, "pass_side_inconsistent_with_striker_side"
-        blocker_objective = raw.get("blocker_objective", "seal_front")
-        striker_objective = raw.get("striker_objective", "gain_lead" if phase == "compress" else "cut_in_front")
-        if blocker_objective not in ALLOWED_BLOCKER_OBJECTIVES:
+        if expected_striker_role and striker_meta.role_hint != expected_striker_role:
+            return None, "contract_role_mismatch"
+        soft_repairs: List[Dict[str, Any]] = []
+        if self.contract_verifier_rules.get("striker_side_matches_pass_side") and striker_meta.side in self.allowed_pass_sides and striker_meta.side != pass_side:
+            soft_repairs.append({
+                "field": "pass_side",
+                "status": "canonicalized_to_striker_side",
+                "legacy_value": pass_side,
+                "resolved_value": striker_meta.side,
+                "not_directly_executed": True,
+                "resolved_by_verifier_planner": True,
+            })
+            pass_side = striker_meta.side
+        if pass_side not in self.allowed_pass_sides:
+            return None, "invalid_pass_side"
+        objective_by_phase = self.contract_defaults.get("striker_objective_by_phase", {})
+        blocker_objective = raw.get("blocker_objective", self.contract_defaults.get("blocker_objective", ""))
+        striker_objective = raw.get("striker_objective", objective_by_phase.get(phase, self.contract_defaults.get("striker_objective", "")))
+        if blocker_objective not in self.allowed_blocker_objectives:
             return None, "invalid_blocker_objective"
-        if striker_objective not in ALLOWED_STRIKER_OBJECTIVES:
+        if striker_objective not in self.allowed_striker_objectives:
             return None, "invalid_striker_objective"
         cut_in_cfg = self.planner_config.get("cut_in", self.planner_config.get("cut_in_and_brake", {}))
         soft_cfg = self.planner_config.get("soft_hints", {})
@@ -286,12 +371,13 @@ class MAIntentCompiler:
             gap_band = "normal"
         if merge_timing not in ("early", "normal", "late"):
             merge_timing = "normal"
-        target_gap, gap_source, soft_repairs = self._resolve_contract_gap(raw, gap_band, cut_in_cfg, soft_cfg)
+        target_gap, gap_source, gap_repairs = self._resolve_contract_gap(raw, gap_band, cut_in_cfg, soft_cfg)
+        soft_repairs.extend(gap_repairs)
         merge_s_offset = self._resolve_merge_offset(raw, merge_timing, target_gap, ego_vehicle, actors[striker_actor], actors[blocker_actor], soft_cfg)
         if "merge_s_offset_m" in raw:
             soft_repairs.append({
                 "field": "merge_s_offset_m",
-                "status": "accepted_as_legacy_soft_hint",
+                "status": "ignored_planner_owned_numeric_hint",
                 "not_directly_executed": True,
                 "resolved_by_verifier_planner": True,
                 "legacy_value": _safe_float(raw.get("merge_s_offset_m"), merge_s_offset),
@@ -352,30 +438,25 @@ class MAIntentCompiler:
             legacy_value = _clamp(_safe_float(raw.get("target_gap_m"), band_targets.get(gap_band, 8.0)), gap_bounds)
             repairs.append({
                 "field": "target_gap_m",
-                "status": "accepted_as_legacy_soft_hint",
+                "status": "ignored_planner_owned_numeric_hint",
                 "not_directly_executed": True,
                 "resolved_by_verifier_planner": True,
                 "legacy_value": legacy_value,
             })
-            if "gap_band" not in raw:
-                return legacy_value, "resolved_from_legacy_soft_hint", repairs
         return _clamp(_safe_float(band_targets.get(gap_band), 8.0), gap_bounds), "resolved_from_gap_band", repairs
 
     def _resolve_merge_offset(self, raw: Dict[str, Any], merge_timing: str, target_gap_m: float, ego_vehicle, striker, blocker, soft_cfg: Dict[str, Any]) -> float:
         cut_in_cfg = self.planner_config.get("cut_in", self.planner_config.get("cut_in_and_brake", {}))
         offset_bounds = cut_in_cfg.get("merge_s_offset_bounds_m", [6.0, 18.0])
         current_gap = self._relative_gap(ego_vehicle, striker) if ego_vehicle is not None else target_gap_m + 6.0
-        ego_speed = float(CarlaDataProvider.get_velocity(ego_vehicle)) if ego_vehicle is not None else 0.0
-        striker_speed = float(CarlaDataProvider.get_velocity(striker))
+        ego_speed = _speed_mps(ego_vehicle) if ego_vehicle is not None else 0.0
+        striker_speed = _speed_mps(striker)
         lane_change_min_duration = self._lane_change_min_duration(striker)
         route_remaining = self._route_remaining_distance(striker)
         timing_scale = {"early": 0.35, "normal": 0.55, "late": 0.75}.get(merge_timing, 0.55)
         close_distance = max(0.0, current_gap - target_gap_m)
         speed_term = max(ego_speed, striker_speed, 2.0) * lane_change_min_duration * 0.5
         resolved = close_distance * timing_scale + speed_term
-        if "merge_s_offset_m" in raw:
-            legacy = _safe_float(raw.get("merge_s_offset_m"), resolved)
-            resolved = 0.8 * resolved + 0.2 * legacy
         max_by_route = max(float(offset_bounds[0]), min(float(offset_bounds[1]), route_remaining - 8.0))
         return _clamp(resolved, [float(offset_bounds[0]), max_by_route])
 
@@ -418,9 +499,9 @@ class MAIntentCompiler:
         defaults = self._default_lifecycle(phase)
         lifecycle = {}
         for key, allowed in (
-            ("advance_if", ALLOWED_ADVANCE_EVENTS),
-            ("abort_if", ALLOWED_ABORT_EVENTS),
-            ("renegotiate_if", ALLOWED_RENEGOTIATE_EVENTS),
+            ("advance_if", self.allowed_advance_events),
+            ("abort_if", self.allowed_abort_events),
+            ("renegotiate_if", self.allowed_renegotiate_events),
         ):
             values = raw.get(key, defaults[key])
             if values is None:
@@ -431,16 +512,24 @@ class MAIntentCompiler:
             if unknown:
                 return {}, "unknown_lifecycle_event_%s" % unknown[0]
             lifecycle[key] = list(dict.fromkeys(values))
-        if phase == "compress" and lifecycle["advance_if"] == ["cutin_success"]:
+        if self.contract_verifier_rules.get("reject_compress_only_cutin_success") and phase == "compress" and lifecycle["advance_if"] == ["cutin_success"]:
             return {}, "compress_advance_if_cannot_only_cutin_success"
         return lifecycle, ""
 
     def _default_lifecycle(self, phase: str) -> Dict[str, List[str]]:
+        lifecycle = self.contract_lifecycle_defaults.get(phase)
+        if isinstance(lifecycle, dict):
+            return {
+                "advance_if": list(lifecycle.get("advance_if", [])),
+                "abort_if": list(lifecycle.get("abort_if", [])),
+                "renegotiate_if": list(lifecycle.get("renegotiate_if", [])),
+            }
         advance_by_phase = {
             "compress": ["blocker_seal_success", "striker_cutin_window_ready"],
             "strike": [],
             "cut_in_committed": ["cutin_success"],
             "brake_pulse": [],
+            "prestage": [],
             "observe": [],
             "recover": [],
         }
@@ -461,29 +550,94 @@ class MAIntentCompiler:
     def _commands_from_contract(self, phase: str, contract: MAContract) -> List[Dict[str, Any]]:
         if phase == "observe":
             return []
-        if phase == "compress":
-            return [
-                {"actor_name": contract.blocker_actor, "role": "Blocker", "tactic": "seal_escape", "target_actor": "ego", "hints": {"lead_gap_hint_m": 16.0}},
-                {"actor_name": contract.striker_actor, "role": "Striker", "tactic": "slot_sync", "target_actor": "ego", "hints": {"speed_band": "hold", "speed_delta_hint_mps": 0.0}},
-            ]
-        if phase in ("strike", "cut_in_committed"):
-            return [
-                {"actor_name": contract.blocker_actor, "role": "Blocker", "tactic": "seal_escape", "target_actor": "ego", "hints": {"lead_gap_hint_m": 12.0}},
-                {"actor_name": contract.striker_actor, "role": "Striker", "tactic": "cut_in", "target_actor": "ego", "hints": {"speed_band": "press"}},
-            ]
-        if phase == "brake_pulse":
-            return [
-                {"actor_name": contract.blocker_actor, "role": "Blocker", "tactic": "seal_escape", "target_actor": "ego", "hints": {"lead_gap_hint_m": 12.0}},
-                {"actor_name": contract.striker_actor, "role": "Striker", "tactic": "front_brake", "target_actor": "ego", "hints": {}},
-            ]
-        return [{"actor_name": actor, "role": role, "tactic": "recover", "target_actor": "none", "hints": {}} for actor, role in ((contract.blocker_actor, "Blocker"), (contract.striker_actor, "Striker"))]
+        templates = self.contract_command_templates.get(phase, [])
+        if templates:
+            return [self._render_contract_command(template, contract) for template in templates]
+        return []
+
+    def _render_contract_command(self, template: Dict[str, Any], contract: MAContract) -> Dict[str, Any]:
+        actor_name = template.get("actor_name")
+        actor_ref = template.get("actor_ref")
+        if actor_name is None and actor_ref:
+            actor_name = getattr(contract, str(actor_ref), "")
+        return {
+            "actor_name": actor_name,
+            "role": template.get("role", ""),
+            "tactic": template.get("tactic", ""),
+            "target_actor": template.get("target_actor", "ego"),
+            "hints": dict(template.get("hints", {})) if isinstance(template.get("hints", {}), dict) else {},
+        }
 
     def _command_matches_contract(self, actor_name: str, role: str, tactic: str, contract: MAContract) -> bool:
-        if role == "Blocker":
-            return actor_name == contract.blocker_actor and tactic in ("seal_escape", "recover")
-        if role == "Striker":
-            return actor_name == contract.striker_actor and tactic in ("gain_lead", "slot_sync", "cut_in", "front_brake", "recover")
+        blocker_role = self.contract_defaults.get("blocker_role")
+        striker_role = self.contract_defaults.get("striker_role")
+        role_actor = {}
+        if blocker_role:
+            role_actor[blocker_role] = contract.blocker_actor
+        if striker_role:
+            role_actor[striker_role] = contract.striker_actor
+        if role in self.contract_command_match:
+            expected_actor = role_actor.get(role)
+            actor_ok = expected_actor is None or actor_name == expected_actor
+            return actor_ok and tactic in self.contract_command_match.get(role, [])
         return tactic == "recover"
+
+    def _command_verifier_rejection(
+        self,
+        when: str,
+        phase: str,
+        tactic: str,
+        actor_name: str,
+        actor,
+        ego_vehicle,
+        actors: Dict[str, Any],
+        meta: MAActorMeta,
+        command_side: str,
+        contract: MAContract = None,
+        params: Dict[str, Any] = None,
+    ) -> Dict[str, Any]:
+        for rule in self.command_verifier_rules:
+            if not isinstance(rule, dict):
+                continue
+            is_after_params = bool(rule.get("after_params", False))
+            if (when == "after_params") != is_after_params:
+                continue
+            if not self._rule_matches(rule, phase, tactic):
+                continue
+            name = rule.get("name")
+            reason = rule.get("reason", name)
+            if name == "require_adjacent_side":
+                if command_side not in rule.get("allowed_sides", []):
+                    return {"status": "rejected", "reason": reason, "actor_name": actor_name, "side": meta.side}
+            elif name == "require_meta_side":
+                if meta.side != rule.get("side"):
+                    return {"status": "rejected", "reason": reason, "actor_name": actor_name, "side": meta.side}
+            elif name == "seal_escape_front_window":
+                unreachable = self._seal_escape_unreachable_reason(actor, ego_vehicle, meta, phase)
+                if unreachable:
+                    return {"status": "rejected", "reason": reason, "unreachable_reason": unreachable, "actor_name": actor_name}
+            elif name == "cut_in_slot_preservation":
+                unreachable = self._gain_lead_unreachable_reason(actor, ego_vehicle, actors, contract, tactic)
+                if unreachable:
+                    return {"status": "rejected", "reason": reason, "unreachable_reason": unreachable, "actor_name": actor_name}
+            elif name == "front_brake_same_lane_gap":
+                unreachable = self._front_brake_unreachable_reason(actor, ego_vehicle)
+                if unreachable:
+                    return {"status": "rejected", "reason": reason, "unreachable_reason": unreachable, "actor_name": actor_name}
+            elif name == "cut_in_adjacent_lane_window":
+                unreachable = self._cut_in_unreachable_reason(actor, ego_vehicle, command_side, params or {}, actors, contract)
+                if unreachable:
+                    return {"status": "rejected", "reason": reason, "unreachable_reason": unreachable, "actor_name": actor_name}
+        return {}
+
+    def _rule_matches(self, rule: Dict[str, Any], phase: str, tactic: str) -> bool:
+        phases = rule.get("phases")
+        if phases is not None and phase not in phases:
+            return False
+        tactics = rule.get("tactics")
+        if tactics is not None and tactic not in tactics:
+            return False
+        return True
 
     def _front_brake_unreachable_reason(self, actor, ego_vehicle) -> str:
         carla_map = CarlaDataProvider.get_map()
@@ -509,16 +663,33 @@ class MAIntentCompiler:
         max_gap = float(cfg.get("max_gap_m", 15.0))
         if not min_gap <= gap <= max_gap:
             return "front_brake_gap_invalid"
-        rel_speed = float(CarlaDataProvider.get_velocity(ego_vehicle)) - float(CarlaDataProvider.get_velocity(actor))
+        rel_speed = _speed_mps(ego_vehicle) - _speed_mps(actor)
         if rel_speed < -float(cfg.get("max_negative_relative_speed_mps", 3.0)):
             return "front_brake_gap_invalid"
         if rel_speed > 0.1 and gap / rel_speed > float(cfg.get("max_ttc_s", 6.0)):
             return "front_brake_gap_invalid"
         return ""
 
-    def _seal_escape_unreachable_reason(self, actor, ego_vehicle) -> str:
+    def _seal_escape_unreachable_reason(self, actor, ego_vehicle, meta: MAActorMeta = None, phase: str = "") -> str:
         gap = self._relative_gap(ego_vehicle, actor)
         cfg = self.planner_config.get("seal_escape", {})
+        return self._seal_escape_unreachable_reason_for_side(actor, ego_vehicle, meta, gap, cfg, phase)
+
+    def _seal_escape_unreachable_reason_for_side(self, actor, ego_vehicle, meta: MAActorMeta, gap: float, cfg: Dict[str, Any], phase: str = "") -> str:
+        if meta is not None and meta.side in ("left", "right"):
+            carla_map = CarlaDataProvider.get_map()
+            actor_wp = carla_map.get_waypoint(actor.get_transform().location, project_to_road=True, lane_type=carla.LaneType.Driving)
+            ego_wp = carla_map.get_waypoint(ego_vehicle.get_transform().location, project_to_road=True, lane_type=carla.LaneType.Driving)
+            if actor_wp is None or ego_wp is None or actor_wp.road_id != ego_wp.road_id:
+                return "blocker_not_in_escape_lane"
+            expected = ego_wp.get_left_lane() if meta.side == "left" else ego_wp.get_right_lane()
+            if expected is None or expected.lane_type != carla.LaneType.Driving or actor_wp.lane_id != expected.lane_id:
+                return "blocker_not_in_escape_lane"
+            bounds = cfg.get("escape_gap_bounds_m", [-2.0, 6.0])
+            margin = float(cfg.get("escape_reacquire_margin_m", 0.0)) if phase == "compress" else 0.0
+            if gap < float(bounds[0]) - margin or gap > float(bounds[1]) + margin:
+                return "blocker_not_in_escape_window"
+            return ""
         min_gap = float(cfg.get("front_window_min_m", cfg.get("target_gap_bounds_m", [8.0, 35.0])[0]))
         max_gap = float(cfg.get("front_window_max_m", cfg.get("target_gap_bounds_m", [8.0, 35.0])[1]))
         if gap < min_gap or gap > max_gap:
@@ -550,34 +721,39 @@ class MAIntentCompiler:
             return "striker_too_far"
         if gap < min_gap:
             return "front_brake_gap_invalid"
-        blocker = actors.get(contract.blocker_actor) if contract is not None else actors.get("blocker_1")
-        if blocker is None or not blocker.is_alive:
-            return "blocker_not_in_front_window"
-        blocker_gap = self._relative_gap(ego_vehicle, blocker)
-        min_clearance = float(cfg.get("min_blocker_clearance_m", 5.0))
+        require_front_blocker = bool(self.planner_config.get("initializer", {}).get("require_front_blocker_for_slot", True))
         slot_bounds = cfg.get("slot_gap_bounds_m", cfg.get("target_gap_bounds_m", [6.0, 9.0]))
         desired_slot = _clamp(float(params.get("target_gap_m", cfg.get("desired_slot_gap_m", 7.0))), slot_bounds)
-        max_slot = blocker_gap - min_clearance
-        if max_slot < float(slot_bounds[0]):
-            return "blocker_clearance_too_small"
-        final_slot = _clamp(min(desired_slot, max_slot), slot_bounds)
-        ego_speed = float(CarlaDataProvider.get_velocity(ego_vehicle))
-        striker_speed = float(CarlaDataProvider.get_velocity(actor))
+        final_slot = desired_slot
+        if require_front_blocker:
+            blocker = actors.get(contract.blocker_actor) if contract is not None else actors.get(self.contract_defaults.get("blocker_actor", ""))
+            if blocker is None or not blocker.is_alive:
+                return "blocker_not_in_front_window"
+            blocker_gap = self._relative_gap(ego_vehicle, blocker)
+            min_clearance = float(cfg.get("min_blocker_clearance_m", 5.0))
+            max_slot = blocker_gap - min_clearance
+            if max_slot < float(slot_bounds[0]):
+                return "blocker_clearance_too_small"
+            final_slot = _clamp(min(desired_slot, max_slot), slot_bounds)
+        ego_speed = _speed_mps(ego_vehicle)
+        striker_speed = _speed_mps(actor)
         lead_in_s = float(cfg.get("lead_in_time_s", 0.6))
         lane_change_min_duration = self._lane_change_min_duration(actor)
         horizon = lead_in_s + lane_change_min_duration
         predicted_gap = gap - max(0.0, ego_speed - striker_speed) * horizon
         predicted_bounds = cfg.get("predicted_slot_gap_bounds_m", [6.0, 9.0])
         tolerance = float(cfg.get("predicted_slot_tolerance_m", 2.0))
+        actual_slot_gap_in_bounds = float(predicted_bounds[0]) <= gap <= float(predicted_bounds[1])
         predicted_in_bounds = float(predicted_bounds[0]) <= predicted_gap <= float(predicted_bounds[1])
         predicted_close_to_final = abs(predicted_gap - final_slot) <= tolerance
-        if not predicted_in_bounds and not predicted_close_to_final:
+        if not actual_slot_gap_in_bounds and not predicted_in_bounds and not predicted_close_to_final:
             return "predicted_slot_gap_invalid"
         params["predicted_cutin_gap_m"] = predicted_gap
         params["desired_slot_gap_m"] = desired_slot
         params["final_slot_gap_m"] = final_slot
         params["predicted_slot_gap_m"] = predicted_gap
         params["predicted_slot_gap_bounds_m"] = [float(predicted_bounds[0]), float(predicted_bounds[1])]
+        params["actual_slot_gap_in_bounds"] = actual_slot_gap_in_bounds
         params["predicted_slot_gap_in_bounds"] = predicted_in_bounds
         params["predicted_slot_gap_close_to_final"] = predicted_close_to_final
         route_remaining = self._route_remaining_distance(actor)
@@ -592,8 +768,13 @@ class MAIntentCompiler:
         return ""
 
     def _gain_lead_unreachable_reason(self, actor, ego_vehicle, actors: Dict[str, Any], contract: MAContract = None, tactic: str = "gain_lead") -> str:
-        blocker = actors.get(contract.blocker_actor) if contract is not None else actors.get("blocker_1")
+        blocker = actors.get(contract.blocker_actor) if contract is not None else actors.get(self.contract_defaults.get("blocker_actor", ""))
         if blocker is None or not blocker.is_alive:
+            return ""
+        carla_map = CarlaDataProvider.get_map()
+        ego_wp = carla_map.get_waypoint(ego_vehicle.get_transform().location, project_to_road=True, lane_type=carla.LaneType.Driving)
+        blocker_wp = carla_map.get_waypoint(blocker.get_transform().location, project_to_road=True, lane_type=carla.LaneType.Driving)
+        if ego_wp is None or blocker_wp is None or ego_wp.road_id != blocker_wp.road_id or ego_wp.lane_id != blocker_wp.lane_id:
             return ""
         cfg = self.planner_config.get("cut_in", self.planner_config.get("cut_in_and_brake", {}))
         striker_gap = self._relative_gap(ego_vehicle, actor)
@@ -640,23 +821,6 @@ class MAIntentCompiler:
                 if float(clamped) != raw:
                     repair_notes.append("clamped_hold_cycles_from_%s_to_%s" % (raw, clamped))
                 continue
-            if key == "speed_delta_hint_mps":
-                raw = _safe_float(value, 0.0)
-                bounds = self._speed_delta_hint_bounds(behavior)
-                clamped = _clamp(raw, bounds)
-                params[key] = clamped
-                params["speed_delta_hint_is_soft"] = True
-                repair_notes.append("speed_delta_hint_mps_soft_relative_not_direct_target")
-                if clamped != raw:
-                    repair_notes.append("clamped_speed_delta_hint_mps_from_%s_to_%s" % (raw, clamped))
-                continue
-            if key == "lead_gap_hint_m":
-                raw = _safe_float(value, 0.0)
-                bounds = self._lead_gap_hint_bounds(meta.role_hint, behavior)
-                clamped = _clamp(raw, bounds)
-                params[key] = clamped
-                if clamped != raw:
-                    repair_notes.append("clamped_lead_gap_hint_m_from_%s_to_%s" % (raw, clamped))
         if behavior == "recover":
             params.setdefault("normal_speed_mps", meta.normal_speed_mps)
             params.setdefault("duration_s", 3.0)
@@ -669,27 +833,18 @@ class MAIntentCompiler:
             params.setdefault("duration_s", params.get("brake_duration_s", 1.0))
         if behavior == "seal_escape":
             params.setdefault("duration_s", params.get("hold_duration_s", 5.0))
+        if params.get("style") == "rolling_prestage":
+            prestage_cfg = self.planner_config.get("prestage", {})
+            params["duration_s"] = float(prestage_cfg.get("duration_s", params.get("duration_s", 6.0)))
+            params["min_speed_mps"] = float(prestage_cfg.get(
+                "striker_min_speed_mps" if meta.role_hint == "Striker" else "blocker_min_speed_mps",
+                prestage_cfg.get("min_speed_mps", params.get("min_speed_mps", 6.8)),
+            ))
+            params["max_speed_mps"] = float(prestage_cfg.get(
+                "max_speed_mps",
+                self.planner_config.get("max_attack_speed_mps", params.get("max_speed_mps", 12.0)),
+            ))
         return params, repair_notes, soft_repairs
 
-    def _lead_gap_hint_bounds(self, role: str, behavior: str) -> List[float]:
-        if role == "Blocker" and behavior == "seal_escape":
-            bounds = self.planner_config.get("seal_escape", {}).get("target_gap_bounds_m", [24.0, 34.0])
-            return [float(bounds[0]), float(bounds[1])]
-        if role == "Striker" and behavior == "front_brake":
-            return [1.0, 8.0]
-        if role == "Striker" and behavior in ("gain_lead", "slot_sync", "cut_in"):
-            return [0.8, 6.0]
-        return [0.8, 25.0]
 
-    def _speed_delta_hint_bounds(self, behavior: str) -> List[float]:
-        if behavior == "front_brake":
-            return [-5.0, -1.0]
-        if behavior == "seal_escape":
-            return [-1.0, 4.0]
-        if behavior == "cut_in":
-            return [-1.0, 2.0]
-        if behavior == "gain_lead":
-            return [-2.0, 4.0]
-        if behavior == "slot_sync":
-            return [-2.0, 2.0]
-        return [-2.0, 2.0]
+CutInIntentCompiler = MAIntentCompiler

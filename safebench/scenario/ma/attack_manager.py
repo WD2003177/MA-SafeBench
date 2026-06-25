@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import asdict, is_dataclass
 from typing import Any, Dict, List, Optional
 
+import carla
+
 from safebench.util.pid_controller import VehiclePIDController
-from safebench.scenario.ma.data_types import PlannedBehavior
+from safebench.scenario.ma.data_types import PlannedBehavior, is_attack_executable
+from safebench.scenario.ma.trajectory import (
+    interpolate_trajectory_point,
+)
 from safebench.scenario.scenario_manager.carla_data_provider import CarlaDataProvider
 
 
@@ -55,6 +61,11 @@ class AttackManager:
         self.path_progress: Dict[str, int] = {}
         self.failure_reasons: Dict[str, str] = {}
         self.last_plan_start_s: Dict[str, float] = {}
+        self.last_controls: Dict[str, Dict[str, float]] = {}
+        self.filtered_dynamics: Dict[str, Dict[str, float]] = {}
+        self.shield_state: Dict[str, Dict[str, Any]] = {}
+        self.replan_requests: Dict[str, Dict[str, Any]] = {}
+        self.last_control_trace_s: Dict[str, float] = {}
         self.reset()
 
     def reset(self) -> None:
@@ -62,6 +73,11 @@ class AttackManager:
         self.path_progress = {}
         self.failure_reasons = {}
         self.last_plan_start_s = {}
+        self.last_controls = {}
+        self.filtered_dynamics = {}
+        self.shield_state = {}
+        self.replan_requests = {}
+        self.last_control_trace_s = {}
         self.controllers = {}
         dt = float(self.config.get("controller_dt", 0.1))
         args_lat = {
@@ -87,8 +103,28 @@ class AttackManager:
                     max_steering=float(self.config.get("pid_max_steering", 0.5)),
                 )
 
+    def _speed_mps(self, actor) -> float:
+        try:
+            velocity = actor.get_velocity()
+            return float(math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2))
+        except Exception:
+            return float(CarlaDataProvider.get_velocity(actor))
+
     def set_planned_behavior(self, plan: PlannedBehavior) -> None:
         previous = self.active.get(plan.actor_name)
+        if previous is not None and self._should_preserve_bootstrap_launch(previous, plan):
+            if self.trace_writer:
+                self.trace_writer.write({
+                    "event": "bootstrap_launch_plan_preserved",
+                    "command_id": plan.command_id,
+                    "active_command_id": previous.command_id,
+                    "actor_name": plan.actor_name,
+                    "behavior": plan.behavior,
+                    "tactic": plan.tactic,
+                    "bootstrap_initial_speed_floor_mps": previous.resolved_physical_params.get("bootstrap_initial_speed_floor_mps"),
+                    "reason": "same_tactic_replan_before_launch_speed_reached",
+                })
+            return
         if previous is not None and self._should_smooth_update_plan(previous, plan):
             old_progress = self.path_progress.get(plan.actor_name, 0)
             self.active[plan.actor_name] = plan
@@ -121,9 +157,35 @@ class AttackManager:
                     "reason": "same_tactic_active_plan",
                 })
             return
+        if self.trace_writer and previous is None and plan.actor_name in self.last_plan_start_s:
+            self.trace_writer.write({
+                "event": "planned_behavior_active_missing_before_set",
+                "command_id": plan.command_id,
+                "actor_name": plan.actor_name,
+                "behavior": plan.behavior,
+                "tactic": plan.tactic,
+                "last_plan_start_s": self.last_plan_start_s.get(plan.actor_name),
+            })
+        if self.trace_writer and previous is not None and previous.tactic == plan.tactic and previous.behavior == plan.behavior:
+            self.trace_writer.write({
+                "event": "planned_behavior_reuse_blocked",
+                "command_id": plan.command_id,
+                "active_command_id": previous.command_id,
+                "actor_name": plan.actor_name,
+                "behavior": plan.behavior,
+                "tactic": plan.tactic,
+                "reason": self._reuse_block_reason(previous, plan),
+            })
         self.active[plan.actor_name] = plan
         self.path_progress[plan.actor_name] = 0
         self.last_plan_start_s[plan.actor_name] = plan.start_time_s
+        self.last_controls.pop(plan.actor_name, None)
+        self.filtered_dynamics.pop(plan.actor_name, None)
+        self.shield_state.pop(plan.actor_name, None)
+        self.replan_requests.pop(plan.actor_name, None)
+        controller = self.controllers.get(plan.actor_name)
+        if controller is not None:
+            controller.reset()
         if self.trace_writer:
             self.trace_writer.write({
                 "event": "planned_behavior_set",
@@ -131,14 +193,39 @@ class AttackManager:
                 "actor_name": plan.actor_name,
                 "behavior": plan.behavior,
                 "tactic": plan.tactic,
+                "requested_tactic": plan.requested_tactic or plan.tactic,
                 "planner_status": plan.planner_status,
                 "path_len": len(plan.path_waypoints),
                 "speed_profile": plan.speed_profile,
+                "execution_mode": plan.execution_mode,
+                "feasibility_status": plan.feasibility_status,
+                "validation_result": plan.validation_result,
                 "resolved_physical_params": plan.resolved_physical_params,
+                "fallback_reason": plan.fallback_reason,
             })
+
+    def _should_preserve_bootstrap_launch(self, previous: PlannedBehavior, incoming: PlannedBehavior) -> bool:
+        params = previous.resolved_physical_params or {}
+        floor = params.get("bootstrap_initial_speed_floor_mps")
+        if floor is None:
+            return False
+        if previous.tactic != incoming.tactic or previous.behavior != incoming.behavior:
+            return False
+        if not is_attack_executable(previous) or not is_attack_executable(incoming):
+            return False
+        elapsed = max(0.0, incoming.start_time_s - previous.start_time_s)
+        if elapsed >= float(self.config.get("bootstrap_launch_duration_s", 2.0)):
+            return False
+        actor = self.actors.get(previous.actor_name)
+        if actor is None or not actor.is_alive:
+            return False
+        min_error = float(self.config.get("bootstrap_launch_min_speed_error_mps", 1.0))
+        return self._speed_mps(actor) < float(floor) - min_error
 
     def _should_reuse_plan(self, previous: PlannedBehavior, incoming: PlannedBehavior) -> bool:
         if not bool(self.config.get("plan_reuse_same_tactic", True)):
+            return False
+        if not is_attack_executable(previous):
             return False
         if previous.tactic != incoming.tactic or previous.behavior != incoming.behavior:
             return False
@@ -147,32 +234,94 @@ class AttackManager:
         elapsed = max(0.0, incoming.start_time_s - previous.start_time_s)
         remaining = previous.duration_s - elapsed
         min_remaining = float(self.config.get("plan_reuse_min_remaining_s", 0.8))
+        if self._plan_target_signature(previous) != self._plan_target_signature(incoming):
+            return False
+        if not is_attack_executable(incoming):
+            return False
+        if previous.trajectory and incoming.trajectory and incoming.tactic not in ("gain_lead", "slot_sync", "seal_escape"):
+            return False
         return remaining >= min_remaining
 
+    def _reuse_block_reason(self, previous: PlannedBehavior, incoming: PlannedBehavior) -> str:
+        if not bool(self.config.get("plan_reuse_same_tactic", True)):
+            return "plan_reuse_same_tactic_disabled"
+        if not is_attack_executable(previous):
+            return "previous_not_attack_executable"
+        if previous.tactic != incoming.tactic or previous.behavior != incoming.behavior:
+            return "tactic_or_behavior_changed"
+        if incoming.tactic == "recover":
+            return "recover_not_reused"
+        if self._plan_target_signature(previous) != self._plan_target_signature(incoming):
+            return "target_signature_changed"
+        if not is_attack_executable(incoming):
+            return "incoming_not_attack_executable"
+        if previous.trajectory and incoming.trajectory and incoming.tactic not in ("gain_lead", "slot_sync", "seal_escape"):
+            return "trajectory_reuse_not_allowed_for_tactic"
+        elapsed = max(0.0, incoming.start_time_s - previous.start_time_s)
+        remaining = previous.duration_s - elapsed
+        min_remaining = float(self.config.get("plan_reuse_min_remaining_s", 0.8))
+        if remaining < min_remaining:
+            return "remaining_below_minimum"
+        return "unknown"
+
     def _should_smooth_update_plan(self, previous: PlannedBehavior, incoming: PlannedBehavior) -> bool:
+        if not is_attack_executable(previous) or not is_attack_executable(incoming):
+            return False
         if previous.tactic != incoming.tactic or previous.behavior != incoming.behavior:
             return False
-        if incoming.tactic != "seal_escape":
+        if incoming.tactic not in ("seal_escape", "slot_sync", "gain_lead"):
             return False
         return self._plan_target_signature(previous) != self._plan_target_signature(incoming)
 
     def _plan_target_signature(self, plan: PlannedBehavior):
         params = plan.resolved_physical_params or {}
         target_gap = params.get("target_gap_m")
+        target_speed = params.get("target_speed_mps")
         bounds = params.get("dynamic_gap_bounds_m")
         try:
             target_gap = round(float(target_gap), 2)
         except (TypeError, ValueError):
             target_gap = None
+        try:
+            target_speed = round(float(target_speed), 2)
+        except (TypeError, ValueError):
+            target_speed = None
         if isinstance(bounds, list):
             bounds = tuple(round(float(item), 2) for item in bounds)
-        return target_gap, bounds
+        return target_gap, target_speed, bounds
 
     def active_behaviors(self) -> Dict[str, str]:
-        return {name: plan.behavior for name, plan in self.active.items()}
+        return {
+            name: plan.behavior
+            for name, plan in self.active.items()
+            if is_attack_executable(plan)
+        }
+
+    def active_plan_meta(self, sim_time_s: float) -> Dict[str, Dict[str, Any]]:
+        result = {}
+        for name, plan in self.active.items():
+            elapsed = max(0.0, sim_time_s - plan.start_time_s)
+            result[name] = {
+                "command_id": plan.command_id,
+                "behavior": plan.behavior,
+                "tactic": plan.tactic,
+                "requested_tactic": plan.requested_tactic or plan.tactic,
+                "execution_mode": plan.execution_mode,
+                "feasibility_status": plan.feasibility_status,
+                "fallback_reason": plan.fallback_reason,
+                "attack_executable": is_attack_executable(plan),
+                "elapsed_s": elapsed,
+                "duration_s": plan.duration_s,
+                "progress": max(0.0, min(1.0, elapsed / max(plan.duration_s, 1e-3))),
+                "shield": dict(self.shield_state.get(name, {})),
+            }
+        return result
 
     def active_command_ids(self) -> List[str]:
         return [plan.command_id for plan in self.active.values()]
+
+    def active_plan_snapshot(self) -> Dict[str, PlannedBehavior]:
+        return dict(self.active)
 
     def min_active_elapsed_s(self, sim_time_s: float) -> float:
         if not self.active:
@@ -182,11 +331,17 @@ class AttackManager:
     def behavior_progress(self, sim_time_s: float) -> Dict[str, Dict[str, Any]]:
         progress = {}
         for name, plan in self.active.items():
+            if not is_attack_executable(plan):
+                continue
             elapsed = max(0.0, sim_time_s - plan.start_time_s)
             progress[name] = {
                 "command_id": plan.command_id,
                 "behavior": plan.behavior,
                 "tactic": plan.tactic,
+                "requested_tactic": plan.requested_tactic or plan.tactic,
+                "execution_mode": plan.execution_mode,
+                "feasibility_status": plan.feasibility_status,
+                "fallback_reason": plan.fallback_reason,
                 "elapsed_s": elapsed,
                 "duration_s": plan.duration_s,
                 "progress": max(0.0, min(1.0, elapsed / max(plan.duration_s, 1e-3))),
@@ -194,6 +349,7 @@ class AttackManager:
         return progress
 
     def tick(self, sim_time_s: float, dt: float) -> None:
+        self._current_sim_time_s = sim_time_s
         completed = []
         for name, plan in list(self.active.items()):
             actor = self.actors.get(name)
@@ -211,19 +367,67 @@ class AttackManager:
                 completed.append(name)
                 continue
             target_transform = self._select_target_transform(actor, plan)
-            target_speed_mps = plan.target_speed_mps(elapsed)
+            target_speed_mps = self._apply_phase_speed_floor(plan, plan.target_speed_mps(elapsed))
+            trajectory_point = (
+                interpolate_trajectory_point(plan.trajectory, elapsed)
+                if plan.trajectory
+                else None
+            )
             if plan.tactic == "recover":
                 target_speed_mps = self._recover_target_speed(actor, target_speed_mps, dt)
+            current_speed_mps = self._speed_mps(actor)
             target_speed_kmh = target_speed_mps * 3.6
             control = controller.run_step(target_speed_kmh, target_transform)
-            max_steer = self._tactic_max_steer(plan)
+            if trajectory_point is not None:
+                tracking_point = self._trajectory_tracking_point(actor, plan, elapsed)
+                control.steer = self._trajectory_steering(actor, tracking_point)
+                accel_gain = float(self.config.get("trajectory", {}).get("accel_feedforward_gain", 0.08))
+                accel_ff = trajectory_point.longitudinal_accel * accel_gain
+                if accel_ff >= 0.0:
+                    control.throttle = min(float(self.config.get("pid_max_throttle", 0.35)), control.throttle + accel_ff)
+                else:
+                    control.brake = min(float(self.config.get("pid_max_brake", 0.2)), control.brake + abs(accel_ff))
+            max_steer = self._plan_max_steer(plan)
             if max_steer is not None:
                 control.steer = max(-max_steer, min(max_steer, control.steer))
+            control = self._apply_control_rate_limits(name, control, dt)
+            control = self._apply_bootstrap_launch_control(name, actor, plan, control, target_speed_mps, current_speed_mps, elapsed)
+            control = self._apply_safety_shield(name, actor, plan, control, sim_time_s, dt)
+            self._prepare_vehicle_for_control(actor, control)
             actor.apply_control(control)
+            assist = self._apply_low_speed_velocity_assist(name, actor, plan, target_speed_mps, current_speed_mps, control, dt)
+            self._trace_control_tick(name, actor, plan, sim_time_s, elapsed, target_speed_mps, current_speed_mps, control, assist)
         for name in completed:
             self.active.pop(name, None)
 
+    def _prepare_vehicle_for_control(self, actor, control) -> None:
+        try:
+            actor.set_simulate_physics(True)
+        except Exception:
+            pass
+        try:
+            actor.set_autopilot(False, CarlaDataProvider.get_traffic_manager_port())
+        except Exception:
+            pass
+        try:
+            control.hand_brake = False
+        except Exception:
+            pass
+        try:
+            control.reverse = False
+        except Exception:
+            pass
+        if bool(self.config.get("force_forward_gear_control", True)):
+            try:
+                control.manual_gear_shift = True
+                control.gear = 1
+            except Exception:
+                pass
+
     def _select_target_transform(self, actor, plan: PlannedBehavior):
+        if plan.trajectory:
+            elapsed = max(0.0, getattr(self, "_current_sim_time_s", plan.start_time_s) - plan.start_time_s)
+            return self._trajectory_tracking_point(actor, plan, elapsed).transform
         if not plan.path_waypoints:
             return actor.get_transform()
         actor_loc = actor.get_transform().location
@@ -250,6 +454,349 @@ class AttackManager:
             prev_loc = transform.location
         return plan.path_waypoints[-1]
 
+    def _trajectory_tracking_point(self, actor, plan: PlannedBehavior, elapsed_s: float):
+        trajectory_cfg = self.config.get("trajectory", {})
+        current_speed = self._speed_mps(actor)
+        lookahead_s = max(
+            float(trajectory_cfg.get("min_time_lookahead_s", 0.2)),
+            min(
+                float(trajectory_cfg.get("max_time_lookahead_s", 0.7)),
+                current_speed * float(trajectory_cfg.get("time_lookahead_speed_gain", 0.04)),
+            ),
+        )
+        return interpolate_trajectory_point(plan.trajectory, elapsed_s + lookahead_s)
+
+    def _trajectory_steering(self, actor, target_point) -> float:
+        trajectory_cfg = self.config.get("trajectory", {})
+        actor_transform = actor.get_transform()
+        target_transform = target_point.transform
+        heading_error_rad = math.radians(
+            (target_transform.rotation.yaw - actor_transform.rotation.yaw + 180.0) % 360.0 - 180.0
+        )
+        target_yaw_rad = math.radians(target_transform.rotation.yaw)
+        left_normal_x = -math.sin(target_yaw_rad)
+        left_normal_y = math.cos(target_yaw_rad)
+        delta_x = target_transform.location.x - actor_transform.location.x
+        delta_y = target_transform.location.y - actor_transform.location.y
+        cross_track_error_m = delta_x * left_normal_x + delta_y * left_normal_y
+        speed_mps = max(0.0, self._speed_mps(actor))
+        cross_track_term = math.atan2(
+            float(trajectory_cfg.get("cross_track_gain", 0.35)) * cross_track_error_m,
+            speed_mps + float(trajectory_cfg.get("cross_track_softening_mps", 2.0)),
+        )
+        return (
+            float(trajectory_cfg.get("steering_feedforward_gain", 1.0))
+            * target_point.steering_feedforward
+            + float(trajectory_cfg.get("heading_error_gain", 0.8)) * heading_error_rad
+            + cross_track_term
+        )
+
+    def _apply_control_rate_limits(self, name: str, control, dt: float):
+        trajectory_cfg = self.config.get("trajectory", {})
+        previous = self.last_controls.get(name, {"steer": 0.0, "throttle": 0.0, "brake": 0.0})
+        steer_step = float(trajectory_cfg.get("max_steer_rate_per_s", 1.0)) * max(dt, 1e-3)
+        throttle_step = float(trajectory_cfg.get("max_throttle_rate_per_s", 1.0)) * max(dt, 1e-3)
+        brake_step = float(trajectory_cfg.get("max_brake_rate_per_s", 1.5)) * max(dt, 1e-3)
+        control.steer = max(previous["steer"] - steer_step, min(previous["steer"] + steer_step, control.steer))
+        control.throttle = max(previous["throttle"] - throttle_step, min(previous["throttle"] + throttle_step, control.throttle))
+        control.brake = max(previous["brake"] - brake_step, min(previous["brake"] + brake_step, control.brake))
+        if control.throttle > 0.02 and control.brake > 0.02:
+            if control.throttle >= control.brake:
+                control.brake = 0.0
+            else:
+                control.throttle = 0.0
+        self.last_controls[name] = {
+            "steer": float(control.steer),
+            "throttle": float(control.throttle),
+            "brake": float(control.brake),
+        }
+        return control
+
+    def _apply_bootstrap_launch_control(self, name: str, actor, plan: PlannedBehavior, control, target_speed_mps: float, current_speed_mps: float, elapsed_s: float):
+        if "bootstrap_initial_speed_floor_mps" not in (plan.resolved_physical_params or {}):
+            return control
+        duration_s = float(self.config.get("bootstrap_launch_duration_s", 2.0))
+        if elapsed_s > duration_s:
+            return control
+        min_error = float(self.config.get("bootstrap_launch_min_speed_error_mps", 1.0))
+        if target_speed_mps <= current_speed_mps + min_error:
+            return control
+        if control.brake > 0.02:
+            return control
+        min_throttle = float(self.config.get("bootstrap_launch_min_throttle", 0.22))
+        max_throttle = float(self.config.get("pid_max_throttle", 0.35))
+        control.throttle = max(float(control.throttle), min(max_throttle, min_throttle))
+        return control
+
+    def _apply_safety_shield(self, name, actor, plan, control, sim_time_s, dt):
+        cfg = self.config.get("trajectory", {}).get("shield", {})
+        phase = str((plan.resolved_physical_params or {}).get("phase") or "")
+        mode = self._shield_mode(plan, phase)
+        plan_elapsed_s = max(0.0, sim_time_s - plan.start_time_s)
+        plan_grace_s = float(cfg.get("plan_start_grace_s", self.config.get("shield_plan_start_grace_s", 1.0)))
+        if plan_elapsed_s < plan_grace_s and mode != "strict":
+            state = self.shield_state.setdefault(name, {})
+            state.update({
+                "mode": mode,
+                "phase": phase,
+                "active": False,
+                "intervention": False,
+                "grace": True,
+                "grace_remaining_s": max(0.0, plan_grace_s - plan_elapsed_s),
+            })
+            return control
+        alpha = max(0.0, min(1.0, float(cfg.get("filter_alpha", 0.35))))
+        transform = actor.get_transform()
+        acceleration = actor.get_acceleration()
+        forward = transform.get_forward_vector()
+        longitudinal = acceleration.x * forward.x + acceleration.y * forward.y + acceleration.z * forward.z
+        accel_mag_sq = acceleration.x ** 2 + acceleration.y ** 2 + acceleration.z ** 2
+        lateral = math.sqrt(max(0.0, accel_mag_sq - longitudinal * longitudinal))
+        filtered = self.filtered_dynamics.setdefault(
+            name,
+            {
+                "longitudinal_accel": longitudinal,
+                "lateral_accel": lateral,
+                "raw_longitudinal_accel": longitudinal,
+                "raw_lateral_accel": lateral,
+                "longitudinal_jerk": 0.0,
+                "lateral_jerk": 0.0,
+            },
+        )
+        longitudinal_jerk = (longitudinal - filtered["raw_longitudinal_accel"]) / max(dt, 1e-3)
+        lateral_jerk = (lateral - filtered["raw_lateral_accel"]) / max(dt, 1e-3)
+        filtered["raw_longitudinal_accel"] = longitudinal
+        filtered["raw_lateral_accel"] = lateral
+        filtered["longitudinal_accel"] = alpha * longitudinal + (1.0 - alpha) * filtered["longitudinal_accel"]
+        filtered["lateral_accel"] = alpha * lateral + (1.0 - alpha) * filtered["lateral_accel"]
+        filtered["longitudinal_jerk"] = alpha * longitudinal_jerk + (1.0 - alpha) * filtered["longitudinal_jerk"]
+        filtered["lateral_jerk"] = alpha * lateral_jerk + (1.0 - alpha) * filtered["lateral_jerk"]
+        constraints = self.config.get("constraints", {})
+        lon_limit = float(constraints.get("max_abs_longitudinal_accel_mps2", 6.0))
+        lat_limit = float(constraints.get("max_lateral_accel_mps2", 3.5))
+        lon_jerk_limit = float(constraints.get("max_abs_jerk_mps3", 8.0))
+        lat_jerk_limit = float(self.config.get("trajectory", {}).get("max_lateral_jerk_mps3", 6.0))
+        soft_ratio = float(cfg.get("soft_limit_ratio", 0.85))
+        exit_ratio = float(cfg.get("exit_limit_ratio", 0.72))
+        required_frames = max(1, int(cfg.get("soft_limit_frames", 3)))
+        state = self.shield_state.setdefault(name, {"soft_count": 0, "active": False, "last_replan_s": -1e9})
+        state.setdefault("soft_count", 0)
+        state.setdefault("active", False)
+        state.setdefault("last_replan_s", -1e9)
+        state["grace"] = False
+        soft_exceeded = (
+            abs(filtered["longitudinal_accel"]) >= lon_limit * soft_ratio
+            or abs(filtered["lateral_accel"]) >= lat_limit * soft_ratio
+            or abs(filtered["longitudinal_jerk"]) >= lon_jerk_limit * soft_ratio
+            or abs(filtered["lateral_jerk"]) >= lat_jerk_limit * soft_ratio
+        )
+        hard_exceeded = (
+            abs(longitudinal) >= lon_limit
+            or abs(lateral) >= lat_limit
+            or abs(longitudinal_jerk) >= lon_jerk_limit
+            or abs(lateral_jerk) >= lat_jerk_limit
+        )
+        strict_waypoint = CarlaDataProvider.get_map().get_waypoint(
+            transform.location, project_to_road=False, lane_type=carla.LaneType.Driving
+        )
+        offroad_risk = strict_waypoint is None
+        front_gap = self._closest_front_gap(actor)
+        collision_risk = front_gap is not None and front_gap <= float(cfg.get("collision_gap_m", 3.0))
+        hard_exceeded = hard_exceeded or offroad_risk or collision_risk
+        state["soft_count"] = state["soft_count"] + 1 if soft_exceeded else 0
+        if mode == "monitor":
+            state["active"] = False
+        elif state["soft_count"] >= required_frames or hard_exceeded:
+            state["active"] = True
+        elif (
+            abs(filtered["longitudinal_accel"]) <= lon_limit * exit_ratio
+            and abs(filtered["lateral_accel"]) <= lat_limit * exit_ratio
+            and abs(filtered["longitudinal_jerk"]) <= lon_jerk_limit * exit_ratio
+            and abs(filtered["lateral_jerk"]) <= lat_jerk_limit * exit_ratio
+        ):
+            state["active"] = False
+        intervention = False
+        if state["active"]:
+            intervention = True
+            if offroad_risk or collision_risk:
+                control.throttle = 0.0
+                control.brake = max(control.brake, float(self.config.get("pid_max_brake", 0.2)))
+                control.steer *= 0.5
+            elif mode == "brake_limited":
+                control.throttle = 0.0
+                control.brake = min(
+                    float(control.brake),
+                    float(cfg.get("front_brake_max_brake", self.config.get("pid_max_brake", 0.2))),
+                )
+            elif abs(filtered["lateral_accel"]) >= lat_limit * soft_ratio or abs(filtered["lateral_jerk"]) >= lat_jerk_limit * soft_ratio:
+                control.steer *= float(cfg.get("steer_scale", 0.8))
+                control.throttle *= float(cfg.get("throttle_scale", 0.7))
+            else:
+                control.throttle *= float(cfg.get("throttle_scale", 0.7))
+            cooldown = float(cfg.get("replan_cooldown_s", 0.4))
+            can_replan = mode == "strict"
+            if can_replan and (hard_exceeded or sim_time_s - state["last_replan_s"] >= cooldown):
+                if offroad_risk:
+                    reason = "shield_offroad_risk"
+                elif collision_risk:
+                    reason = "shield_collision_risk"
+                else:
+                    reason = "shield_hard_limit" if hard_exceeded else "shield_soft_limit"
+                self.replan_requests[name] = {
+                    "actor_name": name,
+                    "hard": bool(hard_exceeded),
+                    "reason": reason,
+                    "sim_time_s": sim_time_s,
+                }
+                state["last_replan_s"] = sim_time_s
+        state["mode"] = mode
+        state["phase"] = phase
+        state["raw_longitudinal_accel_mps2"] = float(longitudinal)
+        state["raw_lateral_accel_mps2"] = float(lateral)
+        state["filtered_longitudinal_accel_mps2"] = float(filtered["longitudinal_accel"])
+        state["filtered_lateral_accel_mps2"] = float(filtered["lateral_accel"])
+        state["raw_longitudinal_jerk_mps3"] = float(longitudinal_jerk)
+        state["raw_lateral_jerk_mps3"] = float(lateral_jerk)
+        state["filtered_longitudinal_jerk_mps3"] = float(filtered["longitudinal_jerk"])
+        state["filtered_lateral_jerk_mps3"] = float(filtered["lateral_jerk"])
+        state["offroad_risk"] = bool(offroad_risk)
+        state["collision_risk"] = bool(collision_risk)
+        state["intervention"] = intervention
+        return control
+
+    def _shield_mode(self, plan: PlannedBehavior, phase: str) -> str:
+        if "bootstrap_initial_speed_floor_mps" in (plan.resolved_physical_params or {}):
+            return str(self.config.get("shield_bootstrap_mode", "monitor"))
+        if phase == "compress":
+            return str(self.config.get("shield_compress_mode", "soft"))
+        if phase in ("strike", "cut_in_committed"):
+            return "strict"
+        if phase == "brake_pulse" or plan.tactic == "front_brake":
+            return "brake_limited"
+        return str(self.config.get("shield_default_mode", "soft"))
+
+    def _apply_low_speed_velocity_assist(self, name: str, actor, plan: PlannedBehavior, target_speed_mps: float, current_speed_mps: float, control, dt: float) -> Dict[str, Any]:
+        if not bool(self.config.get("actuation_velocity_assist_enabled", False)):
+            return {"applied": False, "reason": "disabled"}
+        if not bool(self.config.get("actuation_velocity_assist_debug_allow_set_target_velocity", False)):
+            return {"applied": False, "reason": "debug_only_set_target_velocity_disabled"}
+        if not is_attack_executable(plan):
+            return {"applied": False, "reason": "non_attack_plan"}
+        if plan.tactic not in ("slot_sync", "gain_lead", "seal_escape"):
+            return {"applied": False, "reason": "unsupported_tactic"}
+        if control.brake > 0.02:
+            return {"applied": False, "reason": "braking"}
+        if target_speed_mps <= current_speed_mps + float(self.config.get("actuation_velocity_assist_min_error_mps", 0.4)):
+            return {"applied": False, "reason": "target_reached"}
+        max_speed = float(self.config.get("actuation_velocity_assist_max_speed_mps", self.config.get("max_attack_speed_mps", 12.0)))
+        max_accel = float(self.config.get("actuation_velocity_assist_max_accel_mps2", 4.0))
+        assisted_speed = current_speed_mps + max_accel * max(dt, 1e-3)
+        stall_recovery = self._velocity_assist_stall_recovery_allowed(actor, plan, target_speed_mps, current_speed_mps)
+        if stall_recovery:
+            assisted_speed = max(
+                assisted_speed,
+                float(self.config.get("actuation_velocity_assist_stall_recovery_min_speed_mps", 3.0)),
+            )
+        assisted_speed = min(float(target_speed_mps), max_speed, assisted_speed)
+        if assisted_speed <= current_speed_mps + 1e-3:
+            return {"applied": False, "reason": "no_speed_increase"}
+        transform = actor.get_transform()
+        forward = transform.get_forward_vector()
+        try:
+            actor.set_target_velocity(carla.Vector3D(forward.x * assisted_speed, forward.y * assisted_speed, 0.0))
+        except Exception as exc:
+            return {"applied": False, "reason": "set_target_velocity_failed", "error": str(exc)}
+        return {
+            "applied": True,
+            "stall_recovery": bool(stall_recovery),
+            "current_speed_mps": current_speed_mps,
+            "assisted_speed_mps": assisted_speed,
+            "target_speed_mps": float(target_speed_mps),
+            "max_accel_mps2": max_accel,
+        }
+
+    def _velocity_assist_stall_recovery_allowed(self, actor, plan: PlannedBehavior, target_speed_mps: float, current_speed_mps: float) -> bool:
+        if not bool(self.config.get("actuation_velocity_assist_stall_recovery_enabled", True)):
+            return False
+        if not is_attack_executable(plan):
+            return False
+        phase = str((plan.resolved_physical_params or {}).get("phase") or "")
+        if phase not in ("compress", "strike", "cut_in_committed"):
+            return False
+        if plan.tactic not in ("slot_sync", "gain_lead", "seal_escape"):
+            return False
+        if current_speed_mps > float(self.config.get("actuation_velocity_assist_stall_speed_mps", 1.0)):
+            return False
+        if target_speed_mps < float(self.config.get("actuation_velocity_assist_stall_target_min_mps", 4.0)):
+            return False
+        front_gap = self._closest_front_gap(actor)
+        if front_gap is not None and front_gap <= float(self.config.get("actuation_velocity_assist_stall_front_gap_m", 8.0)):
+            return False
+        return True
+
+    def _trace_control_tick(self, name: str, actor, plan: PlannedBehavior, sim_time_s: float, elapsed_s: float, target_speed_mps: float, current_speed_mps: float, control, assist: Dict[str, Any]) -> None:
+        if self.trace_writer is None or not bool(self.config.get("control_trace_enabled", True)):
+            return
+        interval = float(self.config.get("control_trace_interval_s", 0.5))
+        previous = self.last_control_trace_s.get(name, -1e9)
+        if sim_time_s - previous < interval:
+            return
+        self.last_control_trace_s[name] = sim_time_s
+        shield = dict(self.shield_state.get(name, {}))
+        self.trace_writer.write({
+            "event": "control_tick",
+            "sim_time_s": sim_time_s,
+            "actor_name": name,
+            "command_id": plan.command_id,
+            "behavior": plan.behavior,
+            "tactic": plan.tactic,
+            "requested_tactic": plan.requested_tactic or plan.tactic,
+            "planner_status": plan.planner_status,
+            "execution_mode": plan.execution_mode,
+            "fallback_reason": plan.fallback_reason,
+            "elapsed_s": elapsed_s,
+            "target_speed_mps": float(target_speed_mps),
+            "current_speed_mps": float(current_speed_mps),
+            "applied_control": {
+                "throttle": float(control.throttle),
+                "brake": float(control.brake),
+                "steer": float(control.steer),
+                "hand_brake": bool(getattr(control, "hand_brake", False)),
+                "reverse": bool(getattr(control, "reverse", False)),
+                "manual_gear_shift": bool(getattr(control, "manual_gear_shift", False)),
+                "gear": int(getattr(control, "gear", 0)),
+            },
+            "actor_control_after_apply": {
+                "throttle": float(actor.get_control().throttle),
+                "brake": float(actor.get_control().brake),
+                "steer": float(actor.get_control().steer),
+                "hand_brake": bool(getattr(actor.get_control(), "hand_brake", False)),
+                "reverse": bool(getattr(actor.get_control(), "reverse", False)),
+                "manual_gear_shift": bool(getattr(actor.get_control(), "manual_gear_shift", False)),
+                "gear": int(getattr(actor.get_control(), "gear", 0)),
+            },
+            "velocity_assist": assist,
+            "front_gap_m": self._closest_front_gap(actor),
+            "shield": {
+                "mode": shield.get("mode"),
+                "phase": shield.get("phase"),
+                "active": bool(shield.get("active", False)),
+                "intervention": bool(shield.get("intervention", False)),
+                "offroad_risk": bool(shield.get("offroad_risk", False)),
+                "collision_risk": bool(shield.get("collision_risk", False)),
+                "raw_longitudinal_accel_mps2": shield.get("raw_longitudinal_accel_mps2"),
+                "raw_longitudinal_jerk_mps3": shield.get("raw_longitudinal_jerk_mps3"),
+            },
+        })
+
+    def shield_snapshot(self) -> Dict[str, Dict[str, Any]]:
+        return {name: dict(state) for name, state in self.shield_state.items()}
+
+    def consume_replan_requests(self) -> List[Dict[str, Any]]:
+        requests = list(self.replan_requests.values())
+        self.replan_requests = {}
+        return requests
+
     def _tactic_max_steer(self, plan: PlannedBehavior):
         tactic_cfg = self.config.get(plan.tactic, {}) if isinstance(self.config.get(plan.tactic, {}), dict) else {}
         if "max_steer" not in tactic_cfg:
@@ -259,11 +806,26 @@ class AttackManager:
         except (TypeError, ValueError):
             return None
 
+    def _plan_max_steer(self, plan: PlannedBehavior):
+        if plan.trajectory:
+            return max(
+                0.0,
+                min(
+                    1.0,
+                    float(
+                        self.config.get("trajectory", {}).get(
+                            "max_normalized_steer_command",
+                            1.0,
+                        )
+                    ),
+                ),
+            )
+        return self._tactic_max_steer(plan)
 
     def _recover_target_speed(self, actor, nominal_speed_mps: float, dt: float) -> float:
         recover_cfg = self.config.get("recover", {})
         front_gap = self._closest_front_gap(actor)
-        current_speed = float(CarlaDataProvider.get_velocity(actor))
+        current_speed = self._speed_mps(actor)
         max_decel = abs(float(recover_cfg.get("max_decel_mps2", -2.0)))
         slowdown_gap = float(recover_cfg.get("front_gap_slowdown_m", 10.0))
         min_gap = float(recover_cfg.get("min_front_gap_m", 5.0))
@@ -275,6 +837,27 @@ class AttackManager:
         if front_gap < min_gap:
             return max(0.0, current_speed - max_drop)
         return min(nominal_speed_mps, current_speed)
+
+    def _apply_phase_speed_floor(self, plan: PlannedBehavior, target_speed_mps: float) -> float:
+        if not is_attack_executable(plan):
+            return target_speed_mps
+        phase = str((plan.resolved_physical_params or {}).get("phase") or "")
+        if phase != "prestage" or plan.tactic not in ("gain_lead", "seal_escape"):
+            return target_speed_mps
+        cfg = self.config.get("prestage", {})
+        if not isinstance(cfg, dict):
+            return target_speed_mps
+        role_key = "blocker_min_speed_mps" if plan.tactic == "seal_escape" else "striker_min_speed_mps"
+        try:
+            floor = float(cfg.get(role_key, cfg.get("min_speed_mps", 0.0)))
+            if plan.tactic == "gain_lead" and (plan.resolved_physical_params or {}).get("prestage_gap_state") == "far_ahead":
+                floor = float(cfg.get("striker_far_min_speed_mps", min(floor, 3.0)))
+            max_speed = float(cfg.get("max_speed_mps", self.config.get("max_attack_speed_mps", floor)))
+        except (TypeError, ValueError):
+            return target_speed_mps
+        if floor <= 0.0:
+            return target_speed_mps
+        return max(float(target_speed_mps), min(floor, max_speed))
 
     def _closest_front_gap(self, actor):
         try:
@@ -305,6 +888,9 @@ class AttackManager:
         self.active.pop(name, None)
         self.path_progress.pop(name, None)
         self.failure_reasons.pop(name, None)
+        self.last_controls.pop(name, None)
+        self.filtered_dynamics.pop(name, None)
+        self.shield_state.pop(name, None)
 
     def close(self) -> None:
         self.active = {}

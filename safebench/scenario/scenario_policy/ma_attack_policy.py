@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import copy
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from safebench.scenario.scenario_policy.base_policy import BasePolicy
 from safebench.scenario.ma.ma_action_adapter import cache_ma_action, reset_ma_action_cache, to_safebench_action
 from safebench.scenario.ma.llm_client import OpenAICompatibleClient
+from safebench.scenario.ma.templates.base import DecisionContext
+from safebench.scenario.ma.templates.registry import get_template
 
 
 class MAAttackPolicy(BasePolicy):
@@ -27,6 +29,8 @@ class MAAttackPolicy(BasePolicy):
         self.last_decision_time: Dict[int, float] = {}
         self.last_decisions: Dict[int, Dict[str, Any]] = {}
         self.message_pools: Dict[int, List[Dict[str, Any]]] = {}
+        self.template_by_env: Dict[int, str] = {}
+        self.default_template_id = config.get("ma_template", "cut_in")
         self.llm = OpenAICompatibleClient(config)
         self.logger.log(">> Using MA online attack scenario policy", color="yellow")
 
@@ -47,16 +51,20 @@ class MAAttackPolicy(BasePolicy):
         self.last_decision_time = {}
         self.last_decisions = {}
         self.message_pools = {}
+        self.template_by_env = {}
         reset_ma_action_cache()
         init_actions = []
         for env_id in range(self.num_scenario):
             planner = copy.deepcopy(self.config.get("planner", {}))
             initializer = planner.setdefault("initializer", {})
             initializer["seed"] = int(self.config.get("initializer_seed", self.config.get("ma_seed", 0))) + env_id
+            template_id = self.config.get("ma_template", self.default_template_id)
+            self.template_by_env[env_id] = template_id
             init_actions.append({
                 "policy_type": "ma",
                 "env_id": env_id,
                 "episode_id": self.episode_id,
+                "ma_template": template_id,
                 "planner": planner,
                 "ma_config": self._ma_config(),
             })
@@ -72,8 +80,9 @@ class MAAttackPolicy(BasePolicy):
             self.step_counter[env_id] = step
             sim_time_s = self._sim_time(info, step)
             decision_due = self._decision_due(env_id, sim_time_s)
+            template = self._template_for_info(info, env_id)
             if decision_due:
-                proposal = self._decide(info, env_id, step, sim_time_s)
+                proposal = self._decide(info, env_id, step, sim_time_s, template=template)
                 if proposal.get("_ma_no_scene_summary"):
                     decision_id = self.decision_counter.get(env_id, 0)
                 else:
@@ -82,7 +91,7 @@ class MAAttackPolicy(BasePolicy):
                     self.last_decision_time[env_id] = sim_time_s
                     self.last_decisions[env_id] = proposal
             else:
-                proposal = self.last_decisions.get(env_id, {"phase": "observe", "commands": []})
+                proposal = self.last_decisions.get(env_id, {"phase": template.initial_phase, "commands": []})
                 decision_id = self.decision_counter.get(env_id, 0)
             action = {
                 "policy_type": "ma",
@@ -92,7 +101,8 @@ class MAAttackPolicy(BasePolicy):
                 "sim_time_s": sim_time_s,
                 "decision_id": decision_id,
                 "decision_due": decision_due,
-                "phase": proposal.get("phase", "observe"),
+                "ma_template": template.template_id,
+                "phase": proposal.get("phase", template.initial_phase),
                 "contract": proposal.get("contract"),
                 "commands": proposal.get("commands", []),
                 "raw_decision": proposal if decision_due else None,
@@ -106,6 +116,7 @@ class MAAttackPolicy(BasePolicy):
         self.last_decisions = {}
         self.last_decision_time = {}
         self.message_pools = {}
+        self.template_by_env = {}
         reset_ma_action_cache()
 
 
@@ -127,38 +138,38 @@ class MAAttackPolicy(BasePolicy):
             return True
         return sim_time_s - self.last_decision_time[env_id] >= self.decision_interval_s
 
-    def _decide(self, info: Dict[str, Any], env_id: int, step: int, sim_time_s: float) -> Dict[str, Any]:
+    def _decide(self, info: Dict[str, Any], env_id: int, step: int, sim_time_s: float, template=None) -> Dict[str, Any]:
         summary = info.get("ma_scene_summary") if isinstance(info, dict) else None
+        template = template or self._template_for_info(info, env_id)
         if not summary:
-            return {"phase": "observe", "commands": [], "_ma_no_scene_summary": True, "_ma_decision_source": "no_scene_summary"}
-        if self._should_continue_active_contract(summary):
-            return {
-                "phase": summary.get("phase", "compress"),
-                "commands": [],
-                "_ma_decision_source": "active_contract_runtime",
-                "_ma_contract_id": (summary.get("contract") or {}).get("contract_id"),
+            return {"phase": template.initial_phase, "commands": [], "_ma_no_scene_summary": True, "_ma_decision_source": "no_scene_summary"}
+        working_summary = copy.deepcopy(summary)
+        previous = self.last_decisions.get(env_id)
+        if previous is not None:
+            working_summary["previous_decision_summary"] = {
+                "phase": previous.get("phase"),
+                "num_commands": len(previous.get("commands", [])) if isinstance(previous.get("commands", []), list) else 0,
             }
-        if self.use_llm and summary:
-            summary = copy.deepcopy(summary)
-            previous = self.last_decisions.get(env_id)
-            if previous is not None:
-                summary["previous_decision_summary"] = {
-                    "phase": previous.get("phase"),
-                    "num_commands": len(previous.get("commands", [])) if isinstance(previous.get("commands", []), list) else 0,
-                }
+        context = self._policy_context(working_summary, env_id, step, sim_time_s, default_phase=template.initial_phase)
+        if template.should_continue_contract(context):
+            proposal = template.continue_contract_decision(context)
+            proposal["_ma_decision_source"] = "active_contract_runtime"
+            proposal["_ma_contract_id"] = template.contract_id(context.contract)
+            return proposal
+        if self.use_llm and working_summary:
             self.llm.message_pool = list(self.message_pools.get(env_id, []))
             start_wall_s = time.time()
-            llm_decision = self.llm.complete_json(summary)
+            llm_decision = self.llm.complete_json(working_summary, template.spec_dict())
             llm_elapsed_s = time.time() - start_wall_s
             self.message_pools[env_id] = list(self.llm.message_pool[-20:])
-            if isinstance(llm_decision, dict) and "commands" in llm_decision:
+            if isinstance(llm_decision, dict) and (llm_decision.get("_ma_llm_error") or "commands" in llm_decision):
                 llm_decision["_ma_decision_source"] = "llm"
                 llm_decision["_ma_llm_blocking_elapsed_s"] = llm_elapsed_s
                 llm_decision["_ma_llm_requested_at_sim_time_s"] = sim_time_s
                 if self.llm.last_trace:
                     llm_decision["_ma_coordination_trace"] = copy.deepcopy(self.llm.last_trace)
                 if llm_decision.get("_ma_llm_error") and bool(self.config.get("ma_fallback_on_llm_error", True)):
-                    proposal = self._fallback_rule(info, step)
+                    proposal = template.fallback_decision(context)
                     proposal["_ma_decision_source"] = "fallback_rule_after_llm_error"
                     proposal["_ma_llm_failed_decision"] = llm_decision
                     proposal["_ma_llm_error"] = llm_decision.get("_ma_llm_error")
@@ -167,207 +178,56 @@ class MAAttackPolicy(BasePolicy):
                     if llm_decision.get("_ma_coordination_trace"):
                         proposal["_ma_coordination_trace"] = llm_decision.get("_ma_coordination_trace")
                     return proposal
-                repaired = self._repair_observe_to_bootstrap_contract(info, llm_decision, step)
+                repaired = template.repair_decision(llm_decision, context)
                 if repaired is not None:
-                    repaired["_ma_decision_source"] = "llm_observe_repaired_bootstrap_contract"
+                    repaired["_ma_decision_source"] = "llm_repaired_by_template"
                     repaired["_ma_original_llm_decision"] = llm_decision
                     return repaired
                 return llm_decision
-        proposal = self._fallback_rule(info, step)
+        proposal = template.fallback_decision(context)
         proposal["_ma_decision_source"] = "fallback_rule"
         return proposal
 
-    def _should_continue_active_contract(self, summary: Dict[str, Any]) -> bool:
-        if not bool(self.config.get("ma_hold_active_contract_without_llm", True)):
-            return False
-        if not isinstance(summary, dict) or summary.get("contract_status") != "active":
-            return False
-        phase = summary.get("phase")
-        if phase not in ("compress", "strike", "cut_in_committed", "brake_pulse"):
-            return False
+    def _policy_context(self, summary: Dict[str, Any], env_id: int, step: int, sim_time_s: float, default_phase: str = None) -> DecisionContext:
         risk = summary.get("risk_snapshot", {}) if isinstance(summary.get("risk_snapshot", {}), dict) else {}
-        if phase == "brake_pulse" and (risk.get("ma_event_hard_brake") or risk.get("ma_event_near_miss")):
-            return False
-        if risk.get("ma_realism_violation_step") and self._realism_violation_streak(risk) >= self._realism_abort_required_steps():
-            return False
-        return True
+        return DecisionContext(
+            world=None,
+            ego_vehicle=None,
+            actors={},
+            actor_metadata={},
+            planner_config=self.config.get("planner", {}),
+            ma_config=self._ma_config(),
+            sim_time_s=sim_time_s,
+            dt=float(summary.get("dt", self.config.get("fixed_delta_seconds", 0.1))),
+            phase=summary.get("phase") or default_phase,
+            contract=summary.get("contract"),
+            risk_snapshot=risk,
+            adapter_context={
+                "scene_summary": summary,
+                "policy_config": self.config,
+                "env_id": env_id,
+                "step": step,
+            },
+        )
 
-    def _fallback_rule(self, info: Dict[str, Any], step: int) -> Dict[str, Any]:
-        attackers = {}
-        risk = {}
-        phase = "compress"
-        geometry = {}
+    def _template_for_info(self, info: Dict[str, Any], env_id: int):
+        template_id = self.template_by_env.get(env_id, self.default_template_id)
         if isinstance(info, dict):
-            summary = info.get("ma_scene_summary", {})
-            if isinstance(summary, dict):
-                attackers = {item.get("name"): item for item in summary.get("attackers", []) if isinstance(item, dict)}
-                risk = summary.get("risk_snapshot", {}) if isinstance(summary.get("risk_snapshot", {}), dict) else {}
-                summary_phase = summary.get("phase", phase)
-                contract_status = summary.get("contract_status", "none")
-                if summary_phase in ("compress", "strike", "cut_in_committed", "brake_pulse") and contract_status == "active":
-                    phase = summary_phase
-                else:
-                    phase = "compress"
-                geometry = summary.get("coordination_geometry", {}) if isinstance(summary.get("coordination_geometry", {}), dict) else {}
-        if (phase == "brake_pulse" and (risk.get("ma_event_hard_brake") or risk.get("ma_event_near_miss"))) or (
-            risk.get("ma_realism_violation_step") and self._realism_violation_streak(risk) >= self._realism_abort_required_steps()
-        ):
-            phase = "recover"
-        elif risk.get("ma_event_cutin_success"):
-            phase = "brake_pulse"
-        elif phase == "cut_in_committed":
-            phase = "cut_in_committed"
-        elif geometry.get("blocker_seal_success") and geometry.get("striker_cutin_window_ready"):
-            phase = "strike"
-        striker_hints, blocker_hints = self._adaptive_hints(risk)
-        commands = []
-        if phase == "recover":
-            for actor_name, item in attackers.items():
-                commands.append({
-                    "actor_name": actor_name,
-                    "role": item.get("role_hint", "Recover"),
-                    "tactic": "recover",
-                    "target_actor": "none",
-                    "style": "safe_recover",
-                    "hints": {},
-                })
-            return {"phase": "recover", "commands": commands}
-        contract = self._fallback_contract(phase, attackers, striker_hints)
-        if phase in ("compress", "strike", "cut_in_committed", "brake_pulse") and ("blocker_1" in attackers or not attackers):
-            commands.append({
-                "actor_name": "blocker_1",
-                "role": "Blocker",
-                "tactic": "seal_escape",
-                "target_actor": "ego",
-                "style": "space_compression",
-                "hints": blocker_hints,
-            })
-        if phase == "compress" and ("attacker_1" in attackers or not attackers):
-            commands.append({
-                "actor_name": "attacker_1",
-                "role": "Striker",
-                "tactic": "slot_sync",
-                "target_actor": "ego",
-                "style": "prepare_cut_in_window",
-                "hints": striker_hints,
-            })
-        elif phase in ("strike", "cut_in_committed") and ("attacker_1" in attackers or not attackers):
-            commands.append({
-                "actor_name": "attacker_1",
-                "role": "Striker",
-                "tactic": "cut_in",
-                "target_actor": "ego",
-                "style": "aggressive_but_feasible",
-                "hints": striker_hints,
-            })
-        elif phase == "brake_pulse" and ("attacker_1" in attackers or not attackers):
-            commands.append({
-                "actor_name": "attacker_1",
-                "role": "Striker",
-                "tactic": "front_brake",
-                "target_actor": "ego",
-                "style": "short_brake_pulse",
-                "hints": striker_hints,
-            })
-        return {"phase": phase, "contract": contract, "commands": commands}
-
-    def _repair_observe_to_bootstrap_contract(self, info: Dict[str, Any], decision: Dict[str, Any], step: int) -> Optional[Dict[str, Any]]:
-        if decision.get("phase") != "observe":
-            return None
-        if decision.get("commands"):
-            return None
-        if not bool(self.config.get("ma_repair_initial_observe_to_contract", True)):
-            return None
-        summary = info.get("ma_scene_summary", {}) if isinstance(info, dict) else {}
-        if not isinstance(summary, dict):
-            return None
-        if summary.get("contract_status") == "active":
-            return None
-        risk = summary.get("risk_snapshot", {}) if isinstance(summary.get("risk_snapshot", {}), dict) else {}
-        if risk.get("ma_event_hard_brake") or risk.get("ma_event_near_miss"):
-            return None
-        if risk.get("ma_realism_violation_step") and self._realism_violation_streak(risk) >= self._realism_abort_required_steps():
-            return None
-        geometry = summary.get("coordination_geometry", {}) if isinstance(summary.get("coordination_geometry", {}), dict) else {}
-        if not bool(geometry.get("initial_attack_window_valid")):
-            return None
-        proposal = self._fallback_rule(info, step)
-        proposal["_ma_repair_reason"] = "llm_observe_with_valid_initial_attack_window"
-        proposal["_ma_repair_geometry"] = {
-            "initial_attack_window_valid": geometry.get("initial_attack_window_valid"),
-            "blocker_front_window_ready": geometry.get("blocker_front_window_ready"),
-            "striker_prepare_window_ready": geometry.get("striker_prepare_window_ready"),
-        }
-        return proposal
-
-    def _fallback_contract(self, phase: str, attackers: Dict[str, Any], striker_hints: Dict[str, Any]) -> Dict[str, Any]:
-        striker = attackers.get("attacker_1", {}) if isinstance(attackers, dict) else {}
-        pass_side = striker.get("side") or striker.get("lateral_relation_to_ego") or "left"
-        if pass_side not in ("left", "right"):
-            pass_side = "left"
-        objective_by_phase = {
-            "compress": "gain_lead",
-            "strike": "cut_in_front",
-            "cut_in_committed": "cut_in_front",
-            "brake_pulse": "cut_in_front",
-        }
-        return {
-            "phase": phase,
-            "pass_side": pass_side,
-            "blocker_actor": "blocker_1",
-            "striker_actor": "attacker_1",
-            "blocker_objective": "seal_front",
-            "striker_objective": objective_by_phase.get(phase, "gain_lead"),
-            "gap_band": striker_hints.get("gap_band", "tight"),
-            "merge_timing": striker_hints.get("merge_timing", "early"),
-            "duration_s": 8.0,
-            "target_gap_m": float(striker_hints.get("target_gap_m", 6.0)),
-            "merge_s_offset_m": float(striker_hints.get("merge_s_offset_m", 10.0)),
-            "advance_if": ["blocker_seal_success", "striker_cutin_window_ready"] if phase == "compress" else (["cutin_success"] if phase == "cut_in_committed" else []),
-            "abort_if": self._fallback_abort_events(phase),
-            "renegotiate_if": [] if phase == "cut_in_committed" else ["contract_timeout", "striker_window_lost", "blocker_seal_lost", "ego_lane_changed", "pass_side_blocked"],
-        }
-
-    def _fallback_abort_events(self, phase: str) -> List[str]:
-        base = ["realism_violation", "teleport_detected", "attacker_offroad"]
-        if phase == "cut_in_committed":
-            return ["teleport_detected", "attacker_offroad", "cut_in_timeout"]
-        if phase == "brake_pulse":
-            return base + ["hard_brake", "near_miss"]
-        return base
-
-    def _adaptive_hints(self, risk: Dict[str, Any]):
-        striker_hints: Dict[str, Any] = {"gap_band": "tight", "merge_timing": "early", "speed_band": "press"}
-        blocker_hints: Dict[str, Any] = {"lead_gap_hint_m": 16.0, "speed_band": "hold"}
-        min_ttc = float(risk.get("ma_episode_min_ttc", -1.0)) if isinstance(risk, dict) else -1.0
-        violations = int(risk.get("ma_episode_realism_violation_count", 0)) if isinstance(risk, dict) else 0
-        if min_ttc < 0.0 or min_ttc > 2.5:
-            striker_hints.update({"gap_band": "tight", "merge_timing": "early", "target_gap_m": 4.5, "merge_s_offset_m": 8.0})
-            blocker_hints.update({"lead_gap_hint_m": 16.0})
-        if violations > 0:
-            striker_hints.update({"merge_timing": "normal", "brake_style": "moderate"})
-            blocker_hints.update({"speed_delta_hint_mps": -0.5})
-        return striker_hints, blocker_hints
-
-    def _realism_abort_required_steps(self) -> int:
-        planner_cfg = self.config.get("planner", {}) if isinstance(self.config.get("planner", {}), dict) else {}
-        return max(1, int(planner_cfg.get("realism_abort_consecutive_steps", 3)))
-
-    def _realism_violation_streak(self, risk: Dict[str, Any]) -> int:
-        try:
-            return int(risk.get("ma_realism_violation_streak", 0))
-        except (TypeError, ValueError):
-            return 0
+            summary = info.get("ma_scene_summary")
+            if isinstance(summary, dict) and summary.get("template_id"):
+                template_id = summary.get("template_id")
+                self.template_by_env[env_id] = template_id
+        return get_template(template_id)
 
     def _sim_time(self, info: Dict[str, Any], step: int) -> float:
         if isinstance(info, dict):
-            if "current_game_time" in info:
-                return float(info["current_game_time"])
-            if "ma_sim_time_s" in info:
-                return float(info["ma_sim_time_s"])
             summary = info.get("ma_scene_summary")
             if isinstance(summary, dict) and "sim_time_s" in summary:
                 return float(summary["sim_time_s"])
+            if "ma_sim_time_s" in info:
+                return float(info["ma_sim_time_s"])
+            if "current_game_time" in info:
+                return float(info["current_game_time"])
         return step * float(self.config.get("fixed_delta_seconds", 0.1))
 
     def _ma_config(self) -> Dict[str, Any]:
@@ -376,12 +236,18 @@ class MAAttackPolicy(BasePolicy):
             "decision_interval_s": self.decision_interval_s,
             "trace_enabled": bool(self.config.get("ma_trace_enabled", True)),
             "record_step_metrics": bool(self.config.get("ma_record_step_metrics", True)),
+            "bootstrap_prestage_enabled": bool(self.config.get("ma_bootstrap_prestage_enabled", True)),
             "bootstrap_recover_enabled": bool(self.config.get("ma_bootstrap_recover_enabled", False)),
+            "repair_observe_to_prestage": bool(self.config.get("ma_repair_observe_to_prestage", True)),
+            "initial_attack_bootstrap_enabled": bool(self.config.get("ma_initial_attack_bootstrap_enabled", True)),
+            "initial_attack_bootstrap_apply_control_immediately": bool(self.config.get("ma_initial_attack_bootstrap_apply_control_immediately", True)),
+            "initial_attack_bootstrap_striker_tactic": self.config.get("ma_initial_attack_bootstrap_striker_tactic", "slot_sync"),
             "hold_active_contract_without_llm": bool(self.config.get("ma_hold_active_contract_without_llm", True)),
             "hard_brake_decel_mps2": float(self.config.get("ma_hard_brake_decel_mps2", -3.0)),
             "near_miss_ttc_s": float(self.config.get("ma_near_miss_ttc_s", 1.5)),
             "near_miss_distance_m": float(self.config.get("ma_near_miss_distance_m", 3.0)),
             "cutin_success_gap_m": float(self.config.get("ma_cutin_success_gap_m", 12.0)),
+            "ma_template": self.config.get("ma_template", self.default_template_id),
             "max_abs_longitudinal_accel_mps2": float(constraints.get("max_abs_longitudinal_accel_mps2", 6.0)),
             "max_abs_jerk_mps3": float(constraints.get("max_abs_jerk_mps3", 8.0)),
             "max_lateral_accel_mps2": float(constraints.get("max_lateral_accel_mps2", 3.5)),

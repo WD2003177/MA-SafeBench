@@ -6,15 +6,16 @@ from typing import Any, Dict, List, Optional, Tuple
 
 ALLOWED_TACTICS = ("gain_lead", "slot_sync", "seal_escape", "cut_in", "front_brake", "recover")
 ALLOWED_BEHAVIORS = ALLOWED_TACTICS + ("cut_in_and_brake", "block_ego_lane")
-ALLOWED_PHASES = ("observe", "compress", "strike", "cut_in_committed", "brake_pulse", "recover")
+ALLOWED_PHASES = ("prestage", "observe", "compress", "strike", "cut_in_committed", "brake_pulse", "recover")
 ALLOWED_PASS_SIDES = ("left", "right")
-ALLOWED_BLOCKER_OBJECTIVES = ("seal_left", "seal_right", "seal_front")
+ALLOWED_BLOCKER_OBJECTIVES = ("seal_left", "seal_right", "seal_front", "block_escape_lane")
 ALLOWED_STRIKER_OBJECTIVES = ("pass_left", "pass_right", "cut_in_front", "gain_lead")
 ALLOWED_ADVANCE_EVENTS = ("blocker_seal_success", "striker_cutin_window_ready", "cutin_success")
 ALLOWED_ABORT_EVENTS = ("realism_violation", "teleport_detected", "attacker_offroad", "hard_brake", "near_miss", "cut_in_timeout")
 ALLOWED_RENEGOTIATE_EVENTS = ("contract_timeout", "striker_window_lost", "blocker_seal_lost", "ego_lane_changed", "pass_side_blocked")
 ALLOWED_CONTRACT_EVENTS = ALLOWED_ADVANCE_EVENTS + ALLOWED_ABORT_EVENTS + ALLOWED_RENEGOTIATE_EVENTS
 PHASE_ALLOWED_TACTICS = {
+    "prestage": ("gain_lead", "seal_escape"),
     "observe": tuple(),
     "compress": ("gain_lead", "slot_sync", "seal_escape"),
     "strike": ("cut_in", "seal_escape"),
@@ -26,6 +27,7 @@ LEGACY_BEHAVIOR_TO_TACTIC = {
     "cut_in_and_brake": "cut_in",
     "block_ego_lane": "seal_escape",
 }
+EXECUTABLE_FEASIBILITY_STATUSES = ("normal_feasible", "rate_limited_execution")
 
 
 @dataclass
@@ -66,6 +68,65 @@ class BehaviorIR:
 
 
 @dataclass
+class TrajectoryPoint:
+    """A time-parameterized trajectory sample.
+
+    ``t`` is always relative to ``PlannedBehavior.start_time_s``.
+    """
+
+    t: float
+    transform: Any
+    s: float
+    d: float
+    speed_mps: float
+    longitudinal_accel: float
+    longitudinal_jerk: float
+    lateral_accel: float
+    lateral_jerk: float
+    curvature: float
+    curvature_rate_s: float
+    curvature_rate_t: float
+    front_wheel_angle_rad: float
+    steering_feedforward: float
+
+    @property
+    def longitudinal_accel_mps2(self) -> float:
+        return self.longitudinal_accel
+
+    @property
+    def longitudinal_jerk_mps3(self) -> float:
+        return self.longitudinal_jerk
+
+    @property
+    def lateral_accel_mps2(self) -> float:
+        return self.lateral_accel
+
+    @property
+    def lateral_jerk_mps3(self) -> float:
+        return self.lateral_jerk
+
+
+@dataclass
+class TrajectoryValidationResult:
+    feasible: bool
+    feasibility_status: str
+    reasons: List[str] = field(default_factory=list)
+    peak_values: Dict[str, float] = field(default_factory=dict)
+    limits: Dict[str, float] = field(default_factory=dict)
+    candidate_score: float = float("inf")
+    checked_points: int = 0
+    collision_checks: int = 0
+
+
+def is_attack_executable(plan: Any) -> bool:
+    return bool(
+        plan is not None
+        and getattr(plan, "execution_mode", "") == "attack"
+        and getattr(plan, "feasibility_status", "") in EXECUTABLE_FEASIBILITY_STATUSES
+    )
+
+
+@dataclass
 class PlannedBehavior:
     command_id: str
     actor_name: str
@@ -81,8 +142,24 @@ class PlannedBehavior:
     planner_status: str = "planned"
     planner_notes: List[str] = field(default_factory=list)
     resolved_physical_params: Dict[str, Any] = field(default_factory=dict)
+    trajectory: List[TrajectoryPoint] = field(default_factory=list)
+    execution_mode: str = "attack"
+    feasibility_status: str = "normal_feasible"
+    validation_result: Optional[TrajectoryValidationResult] = None
+    requested_tactic: str = ""
+    fallback_reason: str = ""
 
     def target_speed_mps(self, elapsed_s: float) -> float:
+        if self.trajectory:
+            if elapsed_s <= self.trajectory[0].t:
+                return max(0.0, self.trajectory[0].speed_mps)
+            for idx in range(1, len(self.trajectory)):
+                previous = self.trajectory[idx - 1]
+                current = self.trajectory[idx]
+                if elapsed_s <= current.t:
+                    ratio = (elapsed_s - previous.t) / max(current.t - previous.t, 1e-6)
+                    return max(0.0, previous.speed_mps + (current.speed_mps - previous.speed_mps) * ratio)
+            return max(0.0, self.trajectory[-1].speed_mps)
         if not self.speed_profile:
             return 0.0
         profile = sorted(self.speed_profile, key=lambda item: item[0])
@@ -96,6 +173,18 @@ class PlannedBehavior:
                 ratio = max(0.0, min(1.0, (elapsed_s - prev_t) / span))
                 return max(0.0, prev_v + (next_v - prev_v) * ratio)
         return max(0.0, profile[-1][1])
+
+    def trajectory_point(self, elapsed_s: float) -> Optional[TrajectoryPoint]:
+        if not self.trajectory:
+            return None
+        if elapsed_s <= self.trajectory[0].t:
+            return self.trajectory[0]
+        for idx in range(1, len(self.trajectory)):
+            previous = self.trajectory[idx - 1]
+            current = self.trajectory[idx]
+            if elapsed_s <= current.t:
+                return previous if elapsed_s - previous.t <= current.t - elapsed_s else current
+        return self.trajectory[-1]
 
 
 @dataclass

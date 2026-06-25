@@ -91,8 +91,13 @@ class VehiclePIDController():
         self._lon_controller.change_parameters(**args_longitudinal)
 
     def change_lateral_PID(self, args_lateral):
-        """Changes the parameters of the PIDLongitudinalController"""
-        self._lon_controller.change_parameters(**args_lateral)
+        """Changes the parameters of the lateral PID controller."""
+        self._lat_controller.change_parameters(**args_lateral)
+
+    def reset(self):
+        self.past_steering = self._vehicle.get_control().steer
+        self._lon_controller.reset()
+        self._lat_controller.reset()
 
 
 class PIDLongitudinalController():
@@ -151,6 +156,9 @@ class PIDLongitudinalController():
         self._k_i = K_I
         self._k_d = K_D
         self._dt = dt
+
+    def reset(self):
+        self._error_buffer.clear()
 
 
 class PIDLateralController():
@@ -237,3 +245,6 @@ class PIDLateralController():
         self._k_i = K_I
         self._k_d = K_D
         self._dt = dt
+
+    def reset(self):
+        self._e_buffer.clear()
