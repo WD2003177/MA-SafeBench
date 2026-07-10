@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, List, Optional
 
 from safebench.scenario.ma.data_types import (
@@ -51,7 +52,7 @@ class CutInTemplate(MAScenarioTemplate):
                 "prestage": ["gain_lead"],
                 "compress": ["slot_sync", "gain_lead"],
                 "strike": ["cut_in"],
-                "cut_in_committed": ["cut_in"],
+                "cut_in_committed": ["cut_in", "front_brake"],
                 "brake_pulse": ["front_brake"],
                 "recover": ["recover"],
             },
@@ -197,6 +198,7 @@ class CutInTemplate(MAScenarioTemplate):
                     "Gap sign convention: longitudinal_gap_to_ego_m > 0 means the actor is ahead of ego; < 0 means behind ego. "
                     "Use prestage to keep both attack vehicles rolling before the attack window is valid. "
                     "In compress, keep both attack vehicles rolling and preserving the attack window; do not choose hints that imply stopping unless the planner reports a collision/near-miss. "
+                    "After a committed cut-in reaches ego lane ahead of ego, front_brake is valid to create collision risk, low TTC, or ego hard braking. "
                     "If initial_attack_window_valid is true and no contract is active, choose compress with a block_escape_lane contract instead of observe. "
                     "Do not output waypoints, throttle, steer, brake, target_speed_mps, speed_delta_hint_mps, lead_gap_hint_m, target_gap_m, merge_s_offset_m, brake_decel_mps2, lane_change_duration_s, absolute speed, absolute position, lane id, lane index, or free-form code. "
                     "Numeric speed/gap/merge values are planner-owned and ignored if provided.\n\n"
@@ -215,6 +217,7 @@ class CutInTemplate(MAScenarioTemplate):
                     "Gap sign convention: positive longitudinal gap means the actor is ahead of ego, negative means behind ego. "
                     "When the attack window is not valid yet, use prestage with Striker gain_lead and Blocker seal_escape to keep a moving attack formation; do not use recover for waiting. "
                     "During compress, selector commands should preserve a moving attack window: Striker slot_sync should not park, and Blocker seal_escape should not fall behind ego. "
+                    "In cut_in_committed, switch the Striker to front_brake once it is in ego lane ahead with a valid front gap; collision, low TTC, or forced ego hard braking is an acceptable danger outcome. "
                     "If scene.coordination_geometry.initial_attack_window_valid is true and no active contract exists, do not choose observe; output compress with blocker_objective=block_escape_lane. "
                     "For compress/strike/cut_in_committed/brake_pulse include a contract object with pass_side, blocker_actor, striker_actor, objectives, gap_band, merge_timing, and duration_s. "
                     "For compress/strike/cut_in_committed/brake_pulse commands must be non-empty and must include legal per-agent commands derived from the role-agent proposals. "
@@ -550,6 +553,28 @@ class CutInTemplate(MAScenarioTemplate):
         config = context.adapter_context.get("policy_config", {})
         return config if isinstance(config, dict) else {}
 
+    def _striker_launch_window_ready(self, geometry: Dict[str, Any]) -> bool:
+        if (
+            geometry.get("striker_cutin_window_ready")
+            or geometry.get("striker_cutin_launch_window_ready")
+            or geometry.get("striker_raw_cutin_gap_ready")
+        ):
+            return True
+        if not geometry.get("striker_prepare_window_ready"):
+            return False
+        try:
+            predicted_gap = float(geometry.get("predicted_slot_gap_m"))
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(predicted_gap) or predicted_gap <= 0.0:
+            return False
+        try:
+            final_slot = float(geometry.get("final_slot_gap_m"))
+        except (TypeError, ValueError):
+            final_slot = 7.0
+        setup_gap_upper = max(12.0, final_slot + 5.0)
+        return predicted_gap <= setup_gap_upper
+
     def fallback_decision(self, context: ScenarioContext) -> Dict[str, Any]:
         summary = self._scene_summary(context)
         config = self._policy_config(context)
@@ -575,7 +600,7 @@ class CutInTemplate(MAScenarioTemplate):
             phase = "brake_pulse"
         elif phase == "cut_in_committed":
             phase = "cut_in_committed"
-        elif geometry.get("blocker_seal_success") and geometry.get("striker_cutin_window_ready"):
+        elif geometry.get("blocker_seal_success") and self._striker_launch_window_ready(geometry):
             phase = "strike"
         striker_hints, blocker_hints = self._adaptive_hints(risk)
         if phase == "recover":
@@ -584,10 +609,43 @@ class CutInTemplate(MAScenarioTemplate):
                 commands.append(self.default_recover_command(actor_name, item.get("role_hint", "Recover")))
             return {"phase": "recover", "commands": commands}
         contract = self._fallback_contract(phase, attackers, striker_hints)
-        commands = self._commands_for_phase(phase, attackers, striker_hints, blocker_hints)
+        prefer_front_brake = phase == "cut_in_committed" and self._committed_front_brake_ready(summary, context)
+        commands = self._commands_for_phase(phase, attackers, striker_hints, blocker_hints, prefer_front_brake=prefer_front_brake)
         return {"phase": phase, "contract": contract, "commands": commands}
 
-    def _commands_for_phase(self, phase: str, attackers: Dict[str, Any], striker_hints: Dict[str, Any], blocker_hints: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _committed_front_brake_ready(self, summary: Dict[str, Any], context: ScenarioContext) -> bool:
+        if context.phase != "cut_in_committed" or not isinstance(summary, dict):
+            return False
+        striker_actor = "attacker_1"
+        if isinstance(context.contract, dict):
+            striker_actor = context.contract.get("striker_actor", striker_actor) or striker_actor
+        elif context.contract is not None:
+            striker_actor = getattr(context.contract, "striker_actor", striker_actor) or striker_actor
+        active_meta = context.adapter_context.get("active_plan_meta", {})
+        striker_meta = active_meta.get(striker_actor, {}) if isinstance(active_meta, dict) else {}
+        if not (
+            isinstance(striker_meta, dict)
+            and striker_meta.get("tactic") == "cut_in"
+            and bool(striker_meta.get("attack_executable", True))
+            and not striker_meta.get("fallback_reason")
+        ):
+            return False
+        front_brake_cfg = self._planner_config(context).get("front_brake", {})
+        min_gap = float(front_brake_cfg.get("min_gap_m", 4.0))
+        max_gap = float(front_brake_cfg.get("max_gap_m", 15.0))
+        for item in summary.get("attackers", []):
+            if not isinstance(item, dict) or item.get("name") != striker_actor:
+                continue
+            if item.get("lateral_relation_to_ego") != "same_lane":
+                return False
+            try:
+                gap = float(item.get("longitudinal_gap_to_ego_m"))
+            except (TypeError, ValueError):
+                return False
+            return min_gap <= gap <= max_gap
+        return False
+
+    def _commands_for_phase(self, phase: str, attackers: Dict[str, Any], striker_hints: Dict[str, Any], blocker_hints: Dict[str, Any], prefer_front_brake: bool = False) -> List[Dict[str, Any]]:
         commands = []
         if phase in ("compress", "strike", "cut_in_committed", "brake_pulse") and ("blocker_1" in attackers or not attackers):
             commands.append({
@@ -608,12 +666,13 @@ class CutInTemplate(MAScenarioTemplate):
                 "hints": striker_hints,
             })
         elif phase in ("strike", "cut_in_committed") and ("attacker_1" in attackers or not attackers):
+            tactic = "front_brake" if phase == "cut_in_committed" and prefer_front_brake else "cut_in"
             commands.append({
                 "actor_name": "attacker_1",
                 "role": "Striker",
-                "tactic": "cut_in",
+                "tactic": tactic,
                 "target_actor": "ego",
-                "style": "aggressive_but_feasible",
+                "style": "short_brake_pulse" if tactic == "front_brake" else "aggressive_but_feasible",
                 "hints": striker_hints,
             })
         elif phase == "brake_pulse" and ("attacker_1" in attackers or not attackers):
@@ -717,6 +776,8 @@ class CutInTemplate(MAScenarioTemplate):
             return True
         if not bool(geometry.get("blocker_seal_success")):
             return False
+        if self._striker_launch_window_ready(geometry):
+            return True
         if bool(geometry.get("striker_prepare_window_ready")):
             return True
         prepare_window = geometry.get("striker_prepare_window_m")
@@ -754,7 +815,7 @@ class CutInTemplate(MAScenarioTemplate):
         attackers = {item.get("name"): item for item in summary.get("attackers", []) if isinstance(item, dict)}
         risk = summary.get("risk_snapshot", {}) if isinstance(summary.get("risk_snapshot", {}), dict) else {}
         geometry = summary.get("coordination_geometry", {}) if isinstance(summary.get("coordination_geometry", {}), dict) else {}
-        phase = "strike" if geometry.get("blocker_seal_success") and geometry.get("striker_cutin_window_ready") else "compress"
+        phase = "strike" if geometry.get("blocker_seal_success") and self._striker_launch_window_ready(geometry) else "compress"
         striker_hints, blocker_hints = self._adaptive_hints(risk)
         contract = self._fallback_contract(phase, attackers, striker_hints)
         commands = self._commands_for_phase(phase, attackers, striker_hints, blocker_hints)
@@ -806,6 +867,30 @@ class CutInTemplate(MAScenarioTemplate):
         if risk.get("ma_realism_violation_step") and self._realism_violation_streak(risk) >= self._realism_abort_required_steps(config):
             return False
         return True
+
+    def should_recover_after_empty_compile(self, action: Dict[str, Any], result, context: ScenarioContext) -> bool:
+        if (
+            action.get("_ma_phase_protected_from")
+            and context.phase == "cut_in_committed"
+            and context.contract is not None
+            and context.adapter_context.get("contract_status", "") == "active"
+        ):
+            if isinstance(context.contract, dict):
+                striker_actor = context.contract.get("striker_actor", "attacker_1")
+            else:
+                striker_actor = getattr(context.contract, "striker_actor", "attacker_1")
+            active_meta = context.adapter_context.get("active_plan_meta", {})
+            striker_meta = active_meta.get(striker_actor, {}) if isinstance(active_meta, dict) else {}
+            if (
+                isinstance(striker_meta, dict)
+                and striker_meta.get("tactic") == "cut_in"
+                and bool(striker_meta.get("attack_executable", True))
+            ):
+                return False
+            active_behaviors = context.adapter_context.get("active_behaviors", {})
+            if isinstance(active_behaviors, dict) and active_behaviors.get(striker_actor) == "cut_in":
+                return False
+        return super().should_recover_after_empty_compile(action, result, context)
 
     def protect_active_action(self, action: Dict[str, Any], context: ScenarioContext) -> Optional[Dict[str, Any]]:
         if context.contract is None or context.adapter_context.get("contract_status", "") != "active":
@@ -864,7 +949,7 @@ class CutInTemplate(MAScenarioTemplate):
     def attack_window_still_usable(self, context: ScenarioContext) -> bool:
         summary = self.build_scene_summary(context)
         geometry = summary.get("coordination_geometry", {}) if isinstance(summary, dict) else {}
-        if geometry.get("striker_cutin_window_ready") and geometry.get("blocker_window_ready", geometry.get("blocker_front_window_ready")):
+        if self._striker_launch_window_ready(geometry) and geometry.get("blocker_window_ready", geometry.get("blocker_front_window_ready")):
             return True
         if geometry.get("striker_prepare_window_ready") and geometry.get("blocker_window_ready", geometry.get("blocker_front_window_ready")):
             return True
@@ -887,9 +972,10 @@ class CutInTemplate(MAScenarioTemplate):
             events.add("blocker_seal_success")
         elif can_report_window_lost:
             events.add("blocker_seal_lost")
-        if striker_attack and geometry.get("striker_cutin_window_ready"):
+        striker_window_ready = self._striker_launch_window_ready(geometry)
+        if striker_attack and striker_window_ready:
             events.add("striker_cutin_window_ready")
-        elif can_report_window_lost:
+        elif can_report_window_lost and not striker_window_ready:
             events.add("striker_window_lost")
         if current_phase == "cut_in_committed":
             progress = context.adapter_context.get("behavior_progress", {})
@@ -905,22 +991,38 @@ class CutInTemplate(MAScenarioTemplate):
 
         if not is_attack_executable(plan):
             return None
+        if getattr(plan, "planner_status", "") == "fallback" or getattr(plan, "fallback_reason", ""):
+            return None
         if getattr(ir, "tactic", "") != "cut_in":
             return None
         if context.contract is None or context.phase != "strike":
             return None
         old_phase = context.phase
         new_phase = "cut_in_committed"
+        resolved = plan.resolved_physical_params if isinstance(plan.resolved_physical_params, dict) else {}
+        committed_terminal_t_s = self._committed_terminal_t_s(resolved)
         return {
             "event": "cut_in_committed",
             "new_phase": new_phase,
-            "phase_state_updates": {"cut_in_plan_set_s": context.sim_time_s},
+            "phase_state_updates": {
+                "cut_in_plan_set_s": context.sim_time_s,
+                "cut_in_committed_terminal_t_s": committed_terminal_t_s,
+            },
             "contract": context.contract,
             "from_phase": old_phase,
             "command_id": ir.command_id,
             "actor_name": ir.actor_name,
             "resolved_physical_params": plan.resolved_physical_params,
         }
+
+    @staticmethod
+    def _committed_terminal_t_s(resolved: Dict[str, Any]) -> float:
+        try:
+            lead_in_s = float(resolved.get("lead_in_time_s", 0.0))
+            lane_change_s = float(resolved.get("lane_change_duration_s", 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0.0, lead_in_s + lane_change_s)
 
     def post_phase_advance_action(self, advanced_to: str, context: ScenarioContext) -> Optional[Dict[str, Any]]:
         if advanced_to not in ("strike", "brake_pulse"):
@@ -931,10 +1033,30 @@ class CutInTemplate(MAScenarioTemplate):
             "reason": "phase_advanced_same_tick",
         }
 
+    def should_ignore_shield_replan(self, requests: List[Dict[str, Any]], context: ScenarioContext) -> bool:
+        if context.phase != "cut_in_committed" or context.contract is None:
+            return False
+        striker_actor = context.contract.get("striker_actor") if isinstance(context.contract, dict) else ""
+        if not striker_actor:
+            return False
+        for item in requests:
+            if not isinstance(item, dict):
+                return False
+            if item.get("actor_name") == striker_actor:
+                return False
+            if item.get("reason") != "shield_hard_limit":
+                return False
+        return bool(requests)
+
     def committed_phase_events(self) -> Dict[str, List[str]]:
         return {"success": ["cutin_success"], "danger": ["hard_brake", "near_miss"]}
 
-    def committed_phase_transition(self, current_phase: str, events: set) -> Optional[Dict[str, Any]]:
+    def committed_phase_transition(
+        self,
+        current_phase: str,
+        events: set,
+        context: Optional[ScenarioContext] = None,
+    ) -> Optional[Dict[str, Any]]:
         if current_phase not in ("cut_in_committed", "brake_pulse"):
             return None
         committed_events = self.committed_phase_events()
@@ -946,6 +1068,14 @@ class CutInTemplate(MAScenarioTemplate):
                 "matched_events": matched_success,
             }
         matched_danger = [event for event in committed_events.get("danger", []) if event in events]
+        if current_phase == "cut_in_committed" and "near_miss" in matched_danger:
+            matched_danger = [event for event in matched_danger if event != "near_miss"]
+        if (
+            current_phase == "cut_in_committed"
+            and matched_danger
+            and self._committed_danger_grace_active(context)
+        ):
+            return None
         if matched_danger:
             return {
                 "kind": "danger",
@@ -955,6 +1085,66 @@ class CutInTemplate(MAScenarioTemplate):
                 "recover_reason": "danger_achieved_" + matched_danger[0],
             }
         return None
+
+    def _committed_danger_grace_active(self, context: Optional[ScenarioContext]) -> bool:
+        if context is None:
+            return False
+        raw_cut_cfg = context.planner_config.get("cut_in", {})
+        cut_cfg = raw_cut_cfg if isinstance(raw_cut_cfg, dict) else {}
+        grace_s = float(
+            cut_cfg.get(
+                "committed_danger_grace_s",
+                context.planner_config.get("committed_danger_grace_s", 1.2),
+            )
+        )
+        phase_state = (
+            context.adapter_context.get("phase_state", {})
+            if isinstance(context.adapter_context, dict)
+            else {}
+        )
+        min_ratio = float(
+            cut_cfg.get(
+                "committed_danger_min_elapsed_ratio",
+                context.planner_config.get("committed_danger_min_elapsed_ratio", 0.35),
+            )
+        )
+        terminal_t_s = self._phase_state_float(phase_state, "cut_in_committed_terminal_t_s")
+        if terminal_t_s > 0.0:
+            grace_s = max(grace_s, terminal_t_s * max(0.0, min(1.0, min_ratio)))
+        if grace_s <= 0.0:
+            return False
+        progress = (
+            context.adapter_context.get("behavior_progress", {})
+            if isinstance(context.adapter_context, dict)
+            else {}
+        )
+        striker_progress = progress.get("attacker_1", {}) if isinstance(progress, dict) else {}
+        if isinstance(striker_progress, dict) and striker_progress.get("tactic") == "cut_in":
+            active_grace_s = grace_s
+            try:
+                active_duration_s = float(striker_progress.get("duration_s", 0.0))
+            except (TypeError, ValueError):
+                active_duration_s = 0.0
+            if active_duration_s > 0.0:
+                active_grace_s = max(active_grace_s, active_duration_s * max(0.0, min(1.0, min_ratio)))
+            try:
+                return float(striker_progress.get("elapsed_s", float("inf"))) < active_grace_s
+            except (TypeError, ValueError):
+                return False
+        plan_set_s = phase_state.get("cut_in_plan_set_s") if isinstance(phase_state, dict) else None
+        try:
+            if plan_set_s is not None:
+                return context.sim_time_s - float(plan_set_s) < grace_s
+        except (TypeError, ValueError):
+            pass
+        return False
+
+    @staticmethod
+    def _phase_state_float(phase_state: Dict[str, Any], key: str) -> float:
+        try:
+            return float(phase_state.get(key, 0.0)) if isinstance(phase_state, dict) else 0.0
+        except (TypeError, ValueError):
+            return 0.0
 
     def on_phase_advanced(self, old_phase: str, new_phase: str, context: ScenarioContext) -> Dict[str, Any]:
         if new_phase == "strike":

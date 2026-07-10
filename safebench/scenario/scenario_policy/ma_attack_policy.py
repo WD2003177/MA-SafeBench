@@ -247,6 +247,7 @@ class MAAttackPolicy(BasePolicy):
             "near_miss_ttc_s": float(self.config.get("ma_near_miss_ttc_s", 1.5)),
             "near_miss_distance_m": float(self.config.get("ma_near_miss_distance_m", 3.0)),
             "cutin_success_gap_m": float(self.config.get("ma_cutin_success_gap_m", 12.0)),
+            "command_transition_warmup_frames": int(self.config.get("ma_command_transition_warmup_frames", 3)),
             "ma_template": self.config.get("ma_template", self.default_template_id),
             "max_abs_longitudinal_accel_mps2": float(constraints.get("max_abs_longitudinal_accel_mps2", 6.0)),
             "max_abs_jerk_mps3": float(constraints.get("max_abs_jerk_mps3", 8.0)),

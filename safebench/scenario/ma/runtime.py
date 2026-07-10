@@ -12,6 +12,9 @@ from safebench.scenario.ma.templates.base import ScenarioContext
 from safebench.scenario.ma.templates.registry import get_template
 
 
+MA_RUNTIME_BUILD_TAG = "ma_runtime_danger_stage_20260707"
+
+
 class MATemplateRuntimeScenario(BasicScenario):
     """Generic online MA runtime that delegates scenario semantics to a template."""
 
@@ -62,6 +65,7 @@ class MATemplateRuntimeScenario(BasicScenario):
         self.realism_violation_streak = 0
         self.shield_hard_replan = False
         self.planner_failure_streaks: Dict[str, int] = {}
+        self.danger_achieved = False
 
     def create_behavior(self, scenario_init_action):
         self.init_action = scenario_init_action or {}
@@ -91,6 +95,7 @@ class MATemplateRuntimeScenario(BasicScenario):
         self.realism_violation_streak = 0
         self.shield_hard_replan = False
         self.planner_failure_streaks = {}
+        self.danger_achieved = False
         reset_ma_action_cache(self.env_id)
 
     def initialize_actors(self):
@@ -112,7 +117,7 @@ class MATemplateRuntimeScenario(BasicScenario):
                 "ma_init_failure_reason": self.init_failure_reason or "spawn_failed",
                 "ma_verifier_status_code": "init_failed",
             }
-        self._trace({"event": "scenario_initialized", "env_id": self.env_id, "data_id": self.data_id, "metadata": self._metadata_dict(), "init_metadata": self.init_metadata, "init_failed": self.init_failed, "init_failure_reason": self.init_failure_reason})
+        self._trace({"event": "scenario_initialized", "env_id": self.env_id, "data_id": self.data_id, "ma_runtime_build_tag": MA_RUNTIME_BUILD_TAG, "metadata": self._metadata_dict(), "init_metadata": self.init_metadata, "init_failed": self.init_failed, "init_failure_reason": self.init_failure_reason})
         if not self.init_failed:
             sim_time_s, _ = self._timebase()
             self.last_sim_time_s = sim_time_s
@@ -159,7 +164,19 @@ class MATemplateRuntimeScenario(BasicScenario):
             self.last_action_step = int(action.get("step", self.last_action_step + 1))
             self.last_decision_id = int(action.get("decision_id", self.last_decision_id))
             self._trace({"event": "ma_action_received", "tick": self.tick_count, "sim_time_s": sim_time_s, "action": action})
-            self._handle_action(action, sim_time_s)
+            if getattr(self, "danger_achieved", False):
+                self._trace({
+                    "event": "post_danger_action_ignored",
+                    "tick": self.tick_count,
+                    "sim_time_s": sim_time_s,
+                    "decision_id": self.last_decision_id,
+                    "reason": "danger_already_achieved",
+                    "action_phase": action.get("phase"),
+                })
+                if self._has_active_attack():
+                    self._request_recover("post_danger_achieved", sim_time_s)
+            else:
+                self._handle_action(action, sim_time_s)
         elif action is None and self._has_active_attack():
             max_lag = max(3, int(float(self.ma_config.get("decision_interval_s", 1.0)) / max(dt, 1e-3)) * 3)
             if self.last_action_step >= 0 and self.tick_count - self.last_action_step > max_lag:
@@ -400,6 +417,20 @@ class MATemplateRuntimeScenario(BasicScenario):
             return
         self._trace({"event": "shield_replan_requested", "requests": requests, "sim_time_s": sim_time_s})
         if self.active_contract is not None and self.contract_status == "active":
+            context = self._build_context(
+                sim_time_s=sim_time_s,
+                adapter_context={"shield_replan_requests": requests},
+            )
+            if self.template.should_ignore_shield_replan(requests, context):
+                self._trace({
+                    "event": "shield_replan_ignored",
+                    "reason": "template_ignored_shield_replan",
+                    "requests": requests,
+                    "sim_time_s": sim_time_s,
+                    "phase": self.current_phase,
+                    "contract": self.active_contract,
+                })
+                return
             self.shield_hard_replan = any(bool(item.get("hard")) for item in requests)
             try:
                 self._apply_contract_phase_action(self.current_phase, sim_time_s, "runtime_safety_shield")
@@ -549,7 +580,11 @@ class MATemplateRuntimeScenario(BasicScenario):
             events.discard("realism_violation")
             self._trace({"event": "realism_abort_deferred", "contract": self.active_contract, "active_elapsed_s": active_elapsed_s, "grace_s": grace_s, "streak": self.realism_violation_streak, "realism_violation_reasons": self._realism_violation_reasons()})
 
-        committed_transition = self.template.committed_phase_transition(self.current_phase, events)
+        committed_transition = self.template.committed_phase_transition(
+            self.current_phase,
+            events,
+            self._build_context(risk_snapshot=record),
+        )
         if committed_transition:
             old_phase = self.current_phase
             self.current_phase = committed_transition.get("new_phase", self.current_phase)
@@ -564,6 +599,7 @@ class MATemplateRuntimeScenario(BasicScenario):
                 self.active_contract = self.template.release_contract(self.active_contract, committed_transition.get("failure_reason", matched_events[0] if matched_events else ""))
                 self.contract_status = "released"
                 self.contract_failure_reason = self.template.contract_release_reason(self.active_contract)
+                self.danger_achieved = True
                 self._trace({"event": "contract_danger_achieved", "contract": self.active_contract, "matched_events": matched_events, "current_events": sorted(events)})
                 if self._has_active_attack():
                     self._request_recover(committed_transition.get("recover_reason", "danger_achieved"), self.last_sim_time_s)

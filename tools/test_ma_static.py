@@ -353,9 +353,570 @@ def test_cut_in_summary_uses_runtime_escape_window_bounds() -> None:
 def test_cut_in_verifier_accepts_current_slot_window_like_summary() -> None:
     intent_text = read(ROOT / "safebench/scenario/ma/intent.py")
     summary_text = read(ROOT / "safebench/scenario/ma/scene_summary.py")
+    template_text = read(ROOT / "safebench/scenario/ma/templates/cut_in.py")
     assert "actual_slot_gap_in_bounds" in summary_text
+    assert "cutin_launch_window_ready" in summary_text
+    assert '"striker_cutin_window_ready": any(item.get("cutin_launch_window_ready") for item in attackers)' in summary_text
     assert "actual_slot_gap_in_bounds = float(predicted_bounds[0]) <= gap <= float(predicted_bounds[1])" in intent_text
-    assert "if not actual_slot_gap_in_bounds and not predicted_in_bounds and not predicted_close_to_final:" in intent_text
+    assert "launch_window_ready = min_gap <= gap <= max_gap" in intent_text
+    assert "if not launch_window_ready and not actual_slot_gap_in_bounds and not predicted_in_bounds and not predicted_close_to_final:" in intent_text
+    assert "def _striker_launch_window_ready" in template_text
+    assert 'geometry.get("striker_raw_cutin_gap_ready")' in template_text
+    assert "striker_window_ready = self._striker_launch_window_ready(geometry)" in template_text
+    assert "elif can_report_window_lost and not striker_window_ready:" in template_text
+    assert 'if tactic == "seal_escape" and meta.side in ("left", "right"):' in intent_text
+    assert 'params["escape_blocking"] = True' in intent_text
+    assert 'param_sources["target_gap_m"] = "resolved_from_escape_block_gap"' in intent_text
+    assert "if self._striker_launch_window_ready(geometry):\n            return True" in template_text
+
+
+def test_cutin_launch_window_can_advance_before_predicted_slot_converges() -> None:
+    module_names = [
+        "carla",
+        "safebench",
+        "safebench.scenario",
+        "safebench.scenario.ma",
+        "safebench.scenario.ma.data_types",
+        "safebench.scenario.ma.events",
+        "safebench.scenario.scenario_manager",
+        "safebench.scenario.scenario_manager.carla_data_provider",
+        "scene_summary_launch_window_test",
+    ]
+    saved_modules = {name: sys.modules.get(name) for name in module_names}
+    try:
+        sys.modules["carla"] = types.ModuleType("carla")
+        for package_name in ("safebench", "safebench.scenario", "safebench.scenario.ma", "safebench.scenario.scenario_manager"):
+            package = types.ModuleType(package_name)
+            package.__path__ = []
+            sys.modules[package_name] = package
+        provider_module = types.ModuleType("safebench.scenario.scenario_manager.carla_data_provider")
+        provider_module.CarlaDataProvider = type("CarlaDataProvider", (), {"get_velocity": staticmethod(lambda actor: 0.0)})
+        sys.modules["safebench.scenario.scenario_manager.carla_data_provider"] = provider_module
+        for module_name, relative_path in (
+            ("safebench.scenario.ma.data_types", "safebench/scenario/ma/data_types.py"),
+            ("safebench.scenario.ma.events", "safebench/scenario/ma/events.py"),
+        ):
+            dependency_spec = importlib.util.spec_from_file_location(module_name, ROOT / relative_path)
+            dependency = importlib.util.module_from_spec(dependency_spec)
+            sys.modules[module_name] = dependency
+            dependency_spec.loader.exec_module(dependency)
+        spec = importlib.util.spec_from_file_location(
+            "scene_summary_launch_window_test",
+            ROOT / "safebench/scenario/ma/scene_summary.py",
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        low_speed_result = module._predicted_cutin_geometry(
+            {
+                "striker_in_adjacent_lane": True,
+                "same_road_as_ego": True,
+                "longitudinal_gap_to_ego_m": 17.97,
+                "speed_mps": 5.13,
+            },
+            blocker_gap=4.99,
+            ego_speed=5.85,
+            bounds={
+                "require_front_blocker_for_slot": False,
+                "cutin_start_window_m": [8.0, 34.0],
+                "cut_in": {
+                    "slot_gap_bounds_m": [6.0, 9.0],
+                    "desired_slot_gap_m": 7.0,
+                    "predicted_slot_gap_bounds_m": [6.0, 9.0],
+                    "predicted_slot_tolerance_m": 2.0,
+                    "lead_in_time_s": 0.6,
+                    "lane_change_duration_bounds_s": [2.0, 5.0],
+                },
+            },
+        )
+        assert low_speed_result["cutin_launch_window_ready"] is False
+        assert low_speed_result["cutin_launch_speed_ready"] is False
+        result = module._predicted_cutin_geometry(
+            {
+                "striker_in_adjacent_lane": True,
+                "same_road_as_ego": True,
+                "longitudinal_gap_to_ego_m": 17.97,
+                "speed_mps": 5.8,
+            },
+            blocker_gap=4.99,
+            ego_speed=5.85,
+            bounds={
+                "require_front_blocker_for_slot": False,
+                "cutin_start_window_m": [8.0, 34.0],
+                "cut_in": {
+                    "slot_gap_bounds_m": [6.0, 9.0],
+                    "desired_slot_gap_m": 7.0,
+                    "predicted_slot_gap_bounds_m": [6.0, 9.0],
+                    "predicted_slot_tolerance_m": 2.0,
+                    "lead_in_time_s": 0.6,
+                    "lane_change_duration_bounds_s": [2.0, 5.0],
+                },
+            },
+        )
+        assert result["cutin_launch_window_ready"] is True
+        assert result["cutin_launch_speed_ready"] is True
+        assert result["predicted_cutin_slot_ready"] is False
+        assert result["predicted_slot_gap_m"] > 9.0
+    finally:
+        for name, module in saved_modules.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+
+def test_cut_in_intent_accepts_launch_window_before_predicted_slot_converges() -> None:
+    module_names = [
+        "carla",
+        "safebench",
+        "safebench.scenario",
+        "safebench.scenario.ma",
+        "safebench.scenario.ma.data_types",
+        "safebench.scenario.ma.intent",
+        "safebench.scenario.scenario_manager",
+        "safebench.scenario.scenario_manager.carla_data_provider",
+    ]
+    saved_modules = {name: sys.modules.get(name) for name in module_names}
+    try:
+        carla_mod = types.ModuleType("carla")
+        carla_mod.LaneType = type("LaneType", (), {"Driving": "Driving"})
+        sys.modules["carla"] = carla_mod
+        for package_name in ("safebench", "safebench.scenario", "safebench.scenario.ma", "safebench.scenario.scenario_manager"):
+            package = types.ModuleType(package_name)
+            package.__path__ = []
+            sys.modules[package_name] = package
+
+        data_spec = importlib.util.spec_from_file_location("safebench.scenario.ma.data_types", ROOT / "safebench/scenario/ma/data_types.py")
+        data_mod = importlib.util.module_from_spec(data_spec)
+        sys.modules[data_spec.name] = data_mod
+        data_spec.loader.exec_module(data_mod)
+
+        class Location:
+            def __init__(self, x: float, y: float = 0.0, z: float = 0.0):
+                self.x = x
+                self.y = y
+                self.z = z
+
+        class Transform:
+            def __init__(self, x: float):
+                self.location = Location(x)
+                self.rotation = types.SimpleNamespace(yaw=0.0)
+
+            def get_forward_vector(self):
+                return types.SimpleNamespace(x=1.0, y=0.0, z=0.0)
+
+        class FakeWaypoint:
+            road_id = 1
+            lane_width = 3.5
+            lane_type = carla_mod.LaneType.Driving
+            is_junction = False
+
+            def __init__(self, lane_id: int):
+                self.lane_id = lane_id
+                self.transform = types.SimpleNamespace(rotation=types.SimpleNamespace(yaw=0.0))
+
+            def get_left_lane(self):
+                return FakeWaypoint(0) if self.lane_id == -1 else None
+
+            def get_right_lane(self):
+                return FakeWaypoint(0) if self.lane_id == 1 else None
+
+            def next(self, _distance):
+                return [self]
+
+        class FakeMap:
+            def get_waypoint(self, location, **_kwargs):
+                return FakeWaypoint(-1 if location.x > 0.1 else 0)
+
+        provider_module = types.ModuleType("safebench.scenario.scenario_manager.carla_data_provider")
+        provider_module.CarlaDataProvider = type("CarlaDataProvider", (), {
+            "get_map": staticmethod(lambda: FakeMap()),
+            "get_velocity": staticmethod(lambda _actor: 0.0),
+        })
+        sys.modules["safebench.scenario.scenario_manager.carla_data_provider"] = provider_module
+
+        intent_spec = importlib.util.spec_from_file_location("safebench.scenario.ma.intent", ROOT / "safebench/scenario/ma/intent.py")
+        intent_mod = importlib.util.module_from_spec(intent_spec)
+        sys.modules[intent_spec.name] = intent_mod
+        intent_spec.loader.exec_module(intent_mod)
+
+        class FakeActor:
+            is_alive = True
+
+            def __init__(self, x: float, speed: float):
+                self._transform = Transform(x)
+                self._speed = speed
+
+            def get_transform(self):
+                return self._transform
+
+            def get_velocity(self):
+                return types.SimpleNamespace(x=0.0, y=0.0, z=0.0)
+
+            def get_velocity(self):
+                return types.SimpleNamespace(x=self._speed, y=0.0, z=0.0)
+
+        template_spec = {
+            "template_id": "cut_in",
+            "phases": ["strike"],
+            "phase_allowed_tactics": {"strike": ["cut_in"]},
+            "role_allowed_tactics": {},
+            "contract_events": {},
+            "contract_schema": {"properties": {"pass_side": {"enum": ["right"]}, "blocker_objective": {"enum": []}, "striker_objective": {"enum": []}}},
+            "contract_defaults": {"blocker_actor": "blocker_1"},
+            "contract_command_templates": {},
+            "contract_command_match": {},
+            "contract_lifecycle_defaults": {},
+            "verifier_rules": {},
+            "target_lane_ref_by_tactic": {},
+            "soft_hint_bounds": {},
+        }
+        compiler = intent_mod.MAIntentCompiler(
+            {
+                "initializer": {"require_front_blocker_for_slot": False},
+                "cut_in": {
+                    "start_gap_bounds_m": [8.0, 34.0],
+                    "slot_gap_bounds_m": [6.0, 9.0],
+                    "desired_slot_gap_m": 7.0,
+                    "predicted_slot_gap_bounds_m": [6.0, 9.0],
+                    "predicted_slot_tolerance_m": 2.0,
+                    "lead_in_time_s": 0.6,
+                    "min_route_remaining_m": 20.0,
+                    "max_lane_change_duration_s": 5.0,
+                },
+                "constraints": {"max_lateral_accel_mps2": 3.5},
+                "merge_route_scan_distance_m": 40.0,
+            },
+            template_spec=template_spec,
+        )
+        params = {"target_gap_m": 7.0}
+        reason = compiler._cut_in_unreachable_reason(
+            FakeActor(17.97, 5.13),
+            FakeActor(0.0, 5.85),
+            "right",
+            params,
+            {},
+            data_mod.MAContract(
+                contract_id="contract_1",
+                phase="strike",
+                locked=True,
+                pass_side="right",
+                blocker_actor="blocker_1",
+                striker_actor="attacker_1",
+                blocker_objective="block_escape_lane",
+                striker_objective="cut_in_front",
+                target_gap_m=7.0,
+                merge_s_offset_m=12.0,
+                expire_time_s=30.0,
+            ),
+        )
+        assert reason == ""
+        assert params["cutin_launch_window_ready"] is True
+        assert params["predicted_slot_gap_m"] > 9.0
+        assert params["predicted_slot_gap_in_bounds"] is False
+    finally:
+        for name, module in saved_modules.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+
+def test_prestage_side_blocker_seal_escape_compiles_as_escape_blocking() -> None:
+    module_names = [
+        "carla",
+        "safebench",
+        "safebench.scenario",
+        "safebench.scenario.ma",
+        "safebench.scenario.ma.data_types",
+        "safebench.scenario.ma.intent",
+        "safebench.scenario.scenario_manager",
+        "safebench.scenario.scenario_manager.carla_data_provider",
+    ]
+    saved_modules = {name: sys.modules.get(name) for name in module_names}
+    try:
+        carla_mod = types.ModuleType("carla")
+        carla_mod.LaneType = type("LaneType", (), {"Driving": "Driving"})
+        sys.modules["carla"] = carla_mod
+        for package_name in ("safebench", "safebench.scenario", "safebench.scenario.ma", "safebench.scenario.scenario_manager"):
+            package = types.ModuleType(package_name)
+            package.__path__ = []
+            sys.modules[package_name] = package
+
+        data_spec = importlib.util.spec_from_file_location("safebench.scenario.ma.data_types", ROOT / "safebench/scenario/ma/data_types.py")
+        data_mod = importlib.util.module_from_spec(data_spec)
+        sys.modules[data_spec.name] = data_mod
+        data_spec.loader.exec_module(data_mod)
+
+        class FakeWaypoint:
+            road_id = 1
+            lane_id = 2
+            lane_type = carla_mod.LaneType.Driving
+
+        class FakeMap:
+            def get_waypoint(self, _location, **_kwargs):
+                return FakeWaypoint()
+
+        provider_module = types.ModuleType("safebench.scenario.scenario_manager.carla_data_provider")
+        provider_module.CarlaDataProvider = type("CarlaDataProvider", (), {
+            "get_map": staticmethod(lambda: FakeMap()),
+            "get_velocity": staticmethod(lambda _actor: 0.0),
+        })
+        sys.modules["safebench.scenario.scenario_manager.carla_data_provider"] = provider_module
+
+        intent_spec = importlib.util.spec_from_file_location("safebench.scenario.ma.intent", ROOT / "safebench/scenario/ma/intent.py")
+        intent_mod = importlib.util.module_from_spec(intent_spec)
+        sys.modules[intent_spec.name] = intent_mod
+        intent_spec.loader.exec_module(intent_mod)
+
+        class FakeActor:
+            is_alive = True
+
+            def __init__(self, actor_id: int):
+                self.id = actor_id
+
+            def get_transform(self):
+                return types.SimpleNamespace(location=types.SimpleNamespace(x=0.0, y=0.0, z=0.0))
+
+        template_spec = {
+            "template_id": "cut_in",
+            "phases": ["prestage"],
+            "phase_allowed_tactics": {"prestage": ["seal_escape"]},
+            "role_allowed_tactics": {"Blocker": {"prestage": ["seal_escape"]}},
+            "contract_events": {},
+            "contract_schema": {"properties": {"pass_side": {"enum": ["left", "right"]}, "blocker_objective": {"enum": []}, "striker_objective": {"enum": []}}},
+            "contract_defaults": {},
+            "contract_command_templates": {},
+            "contract_command_match": {},
+            "contract_lifecycle_defaults": {},
+            "verifier_rules": {},
+            "target_lane_ref_by_tactic": {"seal_escape": "current_lane"},
+            "soft_hint_bounds": {},
+        }
+        compiler = intent_mod.MAIntentCompiler(
+            {
+                "seal_escape": {
+                    "escape_target_gap_m": 2.5,
+                    "escape_gap_bounds_m": [-2.0, 6.0],
+                    "hold_duration_s": 8.0,
+                },
+                "prestage": {"blocker_min_speed_mps": 6.8, "max_speed_mps": 10.5},
+                "constraints": {},
+                "min_plan_horizon_s": 2.0,
+                "max_plan_horizon_s": 6.0,
+            },
+            template_spec=template_spec,
+        )
+        behaviors, rejected, contract, contract_event = compiler.compile(
+            {
+                "phase": "prestage",
+                "commands": [
+                    {
+                        "actor_name": "blocker_1",
+                        "role": "Blocker",
+                        "tactic": "seal_escape",
+                        "target_actor": "ego",
+                        "hints": {"style": "rolling_prestage", "speed_band": "hold"},
+                    }
+                ],
+            },
+            FakeActor(1),
+            {"blocker_1": FakeActor(2)},
+            {"blocker_1": data_mod.MAActorMeta("blocker_1", "Blocker", 2, "left", 8.0)},
+            sim_time_s=1.0,
+        )
+        assert rejected == []
+        assert contract is None
+        assert contract_event["event"] == "contract_absent"
+        assert len(behaviors) == 1
+        assert behaviors[0].params["escape_blocking"] is True
+        assert behaviors[0].params["block_escape_side"] == "left"
+        assert behaviors[0].params["target_gap_m"] == 2.5
+        assert behaviors[0].param_sources["target_gap_m"] == "resolved_from_escape_block_gap"
+    finally:
+        for name, module in saved_modules.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+
+def test_compress_side_blocker_can_reacquire_escape_window_before_exact_seal() -> None:
+    module_names = [
+        "carla",
+        "safebench",
+        "safebench.scenario",
+        "safebench.scenario.ma",
+        "safebench.scenario.ma.data_types",
+        "safebench.scenario.ma.intent",
+        "safebench.scenario.scenario_manager",
+        "safebench.scenario.scenario_manager.carla_data_provider",
+    ]
+    saved_modules = {name: sys.modules.get(name) for name in module_names}
+    try:
+        carla_mod = types.ModuleType("carla")
+        carla_mod.LaneType = type("LaneType", (), {"Driving": "Driving"})
+        sys.modules["carla"] = carla_mod
+        for package_name in ("safebench", "safebench.scenario", "safebench.scenario.ma", "safebench.scenario.scenario_manager"):
+            package = types.ModuleType(package_name)
+            package.__path__ = []
+            sys.modules[package_name] = package
+
+        data_spec = importlib.util.spec_from_file_location("safebench.scenario.ma.data_types", ROOT / "safebench/scenario/ma/data_types.py")
+        data_mod = importlib.util.module_from_spec(data_spec)
+        sys.modules[data_spec.name] = data_mod
+        data_spec.loader.exec_module(data_mod)
+
+        class FakeWaypoint:
+            road_id = 1
+            lane_type = carla_mod.LaneType.Driving
+            lane_width = 3.5
+            is_junction = False
+
+            def __init__(self, lane_id: int):
+                self.lane_id = lane_id
+
+            def get_left_lane(self):
+                return FakeWaypoint(2) if self.lane_id == 3 else None
+
+            def get_right_lane(self):
+                return FakeWaypoint(4) if self.lane_id == 3 else None
+
+            def next(self, _distance):
+                return [self]
+
+        class FakeMap:
+            def get_waypoint(self, location, **_kwargs):
+                if location.y > 2.0:
+                    return FakeWaypoint(2)
+                if location.y < -2.0:
+                    return FakeWaypoint(4)
+                return FakeWaypoint(3)
+
+        provider_module = types.ModuleType("safebench.scenario.scenario_manager.carla_data_provider")
+        provider_module.CarlaDataProvider = type("CarlaDataProvider", (), {"get_map": staticmethod(lambda: FakeMap())})
+        sys.modules["safebench.scenario.scenario_manager.carla_data_provider"] = provider_module
+
+        intent_spec = importlib.util.spec_from_file_location("safebench.scenario.ma.intent", ROOT / "safebench/scenario/ma/intent.py")
+        intent_mod = importlib.util.module_from_spec(intent_spec)
+        sys.modules[intent_spec.name] = intent_mod
+        intent_spec.loader.exec_module(intent_mod)
+
+        class Transform:
+            def __init__(self, x: float, y: float):
+                self.location = types.SimpleNamespace(x=x, y=y, z=0.0)
+
+            def get_forward_vector(self):
+                return types.SimpleNamespace(x=1.0, y=0.0, z=0.0)
+
+        class FakeActor:
+            is_alive = True
+
+            def __init__(self, actor_id: int, x: float, y: float):
+                self.id = actor_id
+                self._transform = Transform(x, y)
+
+            def get_transform(self):
+                return self._transform
+
+            def get_velocity(self):
+                return types.SimpleNamespace(x=0.0, y=0.0, z=0.0)
+
+        template_spec = {
+            "template_id": "cut_in",
+            "phases": ["compress"],
+            "phase_allowed_tactics": {"compress": ["seal_escape"]},
+            "role_allowed_tactics": {"Blocker": {"compress": ["seal_escape"]}},
+            "contract_events": {"advance_if": ["blocker_seal_success", "striker_cutin_window_ready"], "abort_if": [], "renegotiate_if": []},
+            "contract_schema": {
+                "properties": {
+                    "pass_side": {"enum": ["left", "right"]},
+                    "blocker_objective": {"enum": ["block_escape_lane"]},
+                    "striker_objective": {"enum": ["gain_lead"]},
+                }
+            },
+            "contract_defaults": {
+                "blocker_actor": "blocker_1",
+                "striker_actor": "attacker_1",
+                "blocker_role": "Blocker",
+                "striker_role": "Striker",
+                "striker_objective_by_phase": {"compress": "gain_lead"},
+            },
+            "contract_command_templates": {},
+            "contract_command_match": {"Blocker": ["seal_escape"]},
+            "contract_lifecycle_defaults": {"compress": {"advance_if": [], "abort_if": [], "renegotiate_if": []}},
+            "verifier_rules": {
+                "command": [
+                    {
+                        "name": "seal_escape_front_window",
+                        "phases": ["compress"],
+                        "tactics": ["seal_escape"],
+                        "reason": "seal_escape_requires_valid_block_window",
+                    }
+                ]
+            },
+            "target_lane_ref_by_tactic": {"seal_escape": "current_lane"},
+            "soft_hint_bounds": {},
+        }
+        compiler = intent_mod.MAIntentCompiler(
+            {
+                "seal_escape": {
+                    "escape_target_gap_m": 2.5,
+                    "escape_gap_bounds_m": [-2.0, 6.0],
+                    "escape_reacquire_margin_m": 6.0,
+                    "hold_duration_s": 8.0,
+                },
+                "soft_hints": {"gap_band_targets_m": {"tight": 7.0}},
+                "cut_in": {"target_gap_bounds_m": [6.0, 9.0]},
+                "contract": {"duration_s": 8.0, "duration_bounds_s": [6.0, 12.0]},
+                "constraints": {},
+                "min_plan_horizon_s": 2.0,
+                "max_plan_horizon_s": 6.0,
+            },
+            template_spec=template_spec,
+        )
+        behaviors, rejected, contract, _event = compiler.compile(
+            {
+                "phase": "compress",
+                "contract": {
+                    "pass_side": "right",
+                    "blocker_actor": "blocker_1",
+                    "striker_actor": "attacker_1",
+                    "blocker_objective": "block_escape_lane",
+                    "striker_objective": "gain_lead",
+                    "gap_band": "tight",
+                    "merge_timing": "early",
+                    "duration_s": 8.0,
+                },
+                "commands": [
+                    {
+                        "actor_name": "blocker_1",
+                        "role": "Blocker",
+                        "tactic": "seal_escape",
+                        "target_actor": "ego",
+                        "hints": {"speed_band": "hold"},
+                    }
+                ],
+            },
+            FakeActor(1, 0.0, 0.0),
+            {"blocker_1": FakeActor(2, 10.2, 3.5), "attacker_1": FakeActor(3, 18.0, -3.5)},
+            {
+                "blocker_1": data_mod.MAActorMeta("blocker_1", "Blocker", 2, "left", 8.0),
+                "attacker_1": data_mod.MAActorMeta("attacker_1", "Striker", 3, "right", 8.0),
+            },
+            sim_time_s=1.0,
+        )
+        assert rejected == []
+        assert contract is not None
+        assert len(behaviors) == 1
+        assert behaviors[0].params["escape_blocking"] is True
+        assert behaviors[0].params["target_gap_m"] == 2.5
+    finally:
+        for name, module in saved_modules.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
 
 
 def test_phase_aware_contract_verifier_guards_exist() -> None:
@@ -489,7 +1050,7 @@ def test_initial_observe_repair_and_v1_semantics_exist() -> None:
     assert "ma_initial_attack_bootstrap_enabled: true" in config_text
     assert "ma_initial_attack_bootstrap_apply_control_immediately: true" in config_text
     assert "ma_repair_initial_observe_to_contract: true" in config_text
-    assert "ma_hold_active_contract_without_llm: false" in config_text
+    assert "ma_hold_active_contract_without_llm: true" in config_text
     assert "step_lag is None or step_lag > 0" in adapter_text
 
 
@@ -547,7 +1108,7 @@ def test_contract_lifecycle_is_phase_aware() -> None:
     assert "target_gap_m: 16.0" in config_text
     assert "compress_gap_bounds_m: [14.0, 22.0]" in config_text
     assert "strike_gap_bounds_m: [10.0, 14.0]" in config_text
-    assert "escape_gap_bounds_m: [-2.0, 6.0]" in config_text
+    assert "escape_gap_bounds_m: [-4.0, 6.0]" in config_text
     assert "min_blocker_clearance_m: 5.0" in config_text
     assert "realism_abort_consecutive_steps: 6" in config_text
     assert "plan_reuse_same_tactic: true" in config_text
@@ -561,10 +1122,10 @@ def test_initializer_success_clears_previous_failure_reason() -> None:
     assert "scenario_variant: 'v2_side_escape_block_plus_opposite_cutin'" in config_text
     assert "require_three_lane: true" in config_text
     assert "rolling_prestage_enabled: true" in config_text
-    assert "striker_prestage_range_m: [20.0, 35.0]" in config_text
-    assert "blocker_prestage_range_m: [10.0, 20.0]" in config_text
-    assert "striker_prestage_offsets_m: [22, 28, 34]" in config_text
-    assert "blocker_prestage_offsets_m: [10, 14, 18]" in config_text
+    assert "striker_prestage_range_m: [16.0, 28.0]" in config_text
+    assert "blocker_prestage_range_m: [6.0, 14.0]" in config_text
+    assert "striker_prestage_offsets_m: [18, 22, 26]" in config_text
+    assert "blocker_prestage_offsets_m: [6, 10, 14]" in config_text
     assert "prestage:" in config_text
     assert "striker_min_speed_mps: 7.0" in config_text
     assert "blocker_min_speed_mps: 6.8" in config_text
@@ -704,11 +1265,13 @@ def test_cutin_effectiveness_and_realism_controls_exist() -> None:
         assert key in attack_text + config_text
     for key in ["warmup_excluded", "raw_measured", "prev_active_commands", "ma_actor_realism_raw", "raw_longitudinal_jerk_mps3"]:
         assert key in metrics_text
+    assert "command_transition_warmup_frames" in metrics_text
+    assert "self.prev_actor_accels.pop(name, None)" in metrics_text
     assert "active_plan_meta" in metrics_text + scenario_text
     assert 'if abs(lon_accel) > self.max_abs_accel' in metrics_text
     assert 'if not warmup_excluded:\n                    violation = True' in metrics_text
     assert 'if abs(lat_accel) > self.max_lateral_accel' in metrics_text
-    assert "start_gap_bounds_m: [8.0, 34.0]" in config_text
+    assert "start_gap_bounds_m: [6.0, 34.0]" in config_text
     assert "slot_gap_bounds_m: [6.0, 9.0]" in config_text
     assert "predicted_slot_tolerance_m: 2.0" in config_text
     assert "max_steer: 0.28" in config_text
@@ -720,7 +1283,7 @@ def test_cutin_effectiveness_and_realism_controls_exist() -> None:
     assert "striker_ahead_of_blocker_no_slot" in read(ROOT / "safebench/scenario/ma/intent.py")
     assert "initial_striker_blocker_slot_clearance_too_small" in read(ROOT / "safebench/scenario/ma/initializer.py")
     assert "compress_realism_abort_grace_s: 4.0" in config_text
-    assert '"cut_in_committed": ["cut_in"]' in template_text
+    assert '"cut_in_committed": ["cut_in", "front_brake"]' in template_text
     assert '"cut_in_committed": ["seal_escape"]' in template_text
 
 
@@ -1329,6 +1892,1237 @@ def test_non_cut_in_dummy_template_runtime_calls_template_hooks() -> None:
         restore_stubbed_modules(saved)
 
 
+def test_raw_cutin_launch_window_advances_template_events() -> None:
+    module_names = [
+        "safebench",
+        "safebench.scenario",
+        "safebench.scenario.ma",
+        "safebench.scenario.ma.data_types",
+        "safebench.scenario.ma.templates",
+        "safebench.scenario.ma.templates.base",
+        "safebench.scenario.ma.templates.cut_in",
+    ]
+    saved = {name: sys.modules.get(name) for name in module_names}
+    try:
+        for name in ["safebench", "safebench.scenario", "safebench.scenario.ma", "safebench.scenario.ma.templates"]:
+            sys.modules[name] = types.ModuleType(name)
+
+        data_spec = importlib.util.spec_from_file_location("safebench.scenario.ma.data_types", ROOT / "safebench/scenario/ma/data_types.py")
+        data_mod = importlib.util.module_from_spec(data_spec)
+        sys.modules[data_spec.name] = data_mod
+        data_spec.loader.exec_module(data_mod)
+
+        base_spec = importlib.util.spec_from_file_location("safebench.scenario.ma.templates.base", ROOT / "safebench/scenario/ma/templates/base.py")
+        base_mod = importlib.util.module_from_spec(base_spec)
+        sys.modules[base_spec.name] = base_mod
+        base_spec.loader.exec_module(base_mod)
+
+        cut_spec = importlib.util.spec_from_file_location("safebench.scenario.ma.templates.cut_in", ROOT / "safebench/scenario/ma/templates/cut_in.py")
+        cut_mod = importlib.util.module_from_spec(cut_spec)
+        sys.modules[cut_spec.name] = cut_mod
+        cut_spec.loader.exec_module(cut_mod)
+
+        scene_summary = {
+            "phase": "compress",
+            "contract_status": "active",
+            "risk_snapshot": {},
+            "attackers": [
+                {"name": "attacker_1", "role_hint": "Striker", "side": "right"},
+                {"name": "blocker_1", "role_hint": "Blocker", "side": "left"},
+            ],
+            "coordination_geometry": {
+                "initial_attack_window_valid": True,
+                "blocker_seal_success": True,
+                "blocker_window_ready": True,
+                "striker_cutin_window_ready": False,
+                "striker_cutin_launch_window_ready": False,
+                "striker_raw_cutin_gap_ready": True,
+                "predicted_cutin_slot_ready": False,
+                "predicted_slot_gap_m": 13.93,
+            },
+        }
+        context = base_mod.ScenarioContext(
+            world=None,
+            ego_vehicle=None,
+            actors={},
+            actor_metadata={},
+            planner_config={},
+            ma_config={},
+            sim_time_s=17.62,
+            dt=0.1,
+            phase="compress",
+            contract={"contract_id": "contract_1", "phase": "compress"},
+            risk_snapshot={},
+            adapter_context={
+                "scene_summary": scene_summary,
+                "active_plan_meta": {
+                    "attacker_1": {"attack_executable": True, "tactic": "slot_sync"},
+                    "blocker_1": {"attack_executable": True, "tactic": "seal_escape"},
+                },
+            },
+        )
+        template = cut_mod.CutInTemplate()
+        template.build_scene_summary = lambda _context: scene_summary
+        events = template.evaluate_events({}, context)
+        assert "blocker_seal_success" in events
+        assert "striker_cutin_window_ready" in events
+
+        setup_geometry = {
+            "blocker_seal_success": True,
+            "blocker_window_ready": True,
+            "striker_cutin_window_ready": False,
+            "striker_cutin_launch_window_ready": False,
+            "striker_raw_cutin_gap_ready": False,
+            "striker_prepare_window_ready": True,
+            "predicted_slot_gap_m": 9.4,
+            "final_slot_gap_m": 7.0,
+        }
+        assert template._striker_launch_window_ready(setup_geometry) is True
+        too_far_setup = dict(setup_geometry)
+        too_far_setup["predicted_slot_gap_m"] = 18.0
+        assert template._striker_launch_window_ready(too_far_setup) is False
+
+        decision = template.fallback_decision(context)
+        assert decision["phase"] == "strike"
+        assert any(cmd["tactic"] == "cut_in" for cmd in decision["commands"])
+
+        prestage_context = base_mod.ScenarioContext(
+            world=None,
+            ego_vehicle=None,
+            actors={},
+            actor_metadata={},
+            planner_config={},
+            ma_config={},
+            sim_time_s=17.62,
+            dt=0.1,
+            phase="prestage",
+            contract=None,
+            risk_snapshot={},
+            adapter_context={"scene_summary": {**scene_summary, "phase": "prestage", "contract_status": "none"}},
+        )
+        repair = template.repair_decision(
+            {"phase": "prestage", "commands": [{"agent": "Striker", "tactic": "gain_lead"}]},
+            prestage_context,
+        )
+        assert repair["phase"] == "strike"
+        assert any(cmd["tactic"] == "cut_in" for cmd in repair["commands"])
+
+        fallback_context = base_mod.ScenarioContext(
+            world=None,
+            ego_vehicle=None,
+            actors={},
+            actor_metadata={},
+            planner_config={},
+            ma_config={},
+            sim_time_s=18.19,
+            dt=0.1,
+            phase="strike",
+            contract={"contract_id": "contract_1", "phase": "strike"},
+            risk_snapshot={},
+            adapter_context={
+                "scene_summary": scene_summary,
+                "active_plan_meta": {
+                    "attacker_1": {"attack_executable": False, "tactic": "cut_in", "execution_mode": "fallback"},
+                    "blocker_1": {"attack_executable": True, "tactic": "seal_escape"},
+                },
+            },
+        )
+        fallback_events = template.evaluate_events({}, fallback_context)
+        assert "striker_window_lost" not in fallback_events
+    finally:
+        restore_stubbed_modules(saved)
+
+
+def test_prestage_repair_to_strike_compiles_cutin_and_escape_blocker_ir() -> None:
+    module_names = [
+        "carla",
+        "safebench",
+        "safebench.scenario",
+        "safebench.scenario.ma",
+        "safebench.scenario.ma.data_types",
+        "safebench.scenario.ma.intent",
+        "safebench.scenario.ma.templates",
+        "safebench.scenario.ma.templates.base",
+        "safebench.scenario.ma.templates.cut_in",
+        "safebench.scenario.scenario_manager",
+        "safebench.scenario.scenario_manager.carla_data_provider",
+    ]
+    saved = {name: sys.modules.get(name) for name in module_names}
+    try:
+        carla_mod = types.ModuleType("carla")
+        carla_mod.LaneType = type("LaneType", (), {"Driving": "Driving"})
+        sys.modules["carla"] = carla_mod
+        for name in [
+            "safebench",
+            "safebench.scenario",
+            "safebench.scenario.ma",
+            "safebench.scenario.ma.templates",
+            "safebench.scenario.scenario_manager",
+        ]:
+            package = types.ModuleType(name)
+            package.__path__ = []
+            sys.modules[name] = package
+
+        data_spec = importlib.util.spec_from_file_location("safebench.scenario.ma.data_types", ROOT / "safebench/scenario/ma/data_types.py")
+        data_mod = importlib.util.module_from_spec(data_spec)
+        sys.modules[data_spec.name] = data_mod
+        data_spec.loader.exec_module(data_mod)
+
+        class FakeWaypoint:
+            road_id = 1
+            lane_type = carla_mod.LaneType.Driving
+            lane_width = 3.5
+            is_junction = False
+
+            def __init__(self, lane_id: int):
+                self.lane_id = lane_id
+                self.transform = types.SimpleNamespace(rotation=types.SimpleNamespace(yaw=0.0))
+
+            def get_left_lane(self):
+                if self.lane_id == 3:
+                    return FakeWaypoint(2)
+                if self.lane_id == 4:
+                    return FakeWaypoint(3)
+                return None
+
+            def get_right_lane(self):
+                if self.lane_id == 3:
+                    return FakeWaypoint(4)
+                if self.lane_id == 2:
+                    return FakeWaypoint(3)
+                return None
+
+            def next(self, _distance):
+                return [self]
+
+        class FakeMap:
+            def get_waypoint(self, location, **_kwargs):
+                if location.y > 2.0:
+                    return FakeWaypoint(2)
+                if location.y < -2.0:
+                    return FakeWaypoint(4)
+                return FakeWaypoint(3)
+
+        provider_module = types.ModuleType("safebench.scenario.scenario_manager.carla_data_provider")
+        provider_module.CarlaDataProvider = type("CarlaDataProvider", (), {
+            "get_map": staticmethod(lambda: FakeMap()),
+            "get_velocity": staticmethod(lambda _actor: 0.0),
+        })
+        sys.modules["safebench.scenario.scenario_manager.carla_data_provider"] = provider_module
+
+        intent_spec = importlib.util.spec_from_file_location("safebench.scenario.ma.intent", ROOT / "safebench/scenario/ma/intent.py")
+        intent_mod = importlib.util.module_from_spec(intent_spec)
+        sys.modules[intent_spec.name] = intent_mod
+        intent_spec.loader.exec_module(intent_mod)
+
+        base_spec = importlib.util.spec_from_file_location("safebench.scenario.ma.templates.base", ROOT / "safebench/scenario/ma/templates/base.py")
+        base_mod = importlib.util.module_from_spec(base_spec)
+        sys.modules[base_spec.name] = base_mod
+        base_spec.loader.exec_module(base_mod)
+
+        cut_spec = importlib.util.spec_from_file_location("safebench.scenario.ma.templates.cut_in", ROOT / "safebench/scenario/ma/templates/cut_in.py")
+        cut_mod = importlib.util.module_from_spec(cut_spec)
+        sys.modules[cut_spec.name] = cut_mod
+        cut_spec.loader.exec_module(cut_mod)
+
+        class Transform:
+            def __init__(self, x: float, y: float):
+                self.location = types.SimpleNamespace(x=x, y=y, z=0.0)
+                self.rotation = types.SimpleNamespace(yaw=0.0)
+
+            def get_forward_vector(self):
+                return types.SimpleNamespace(x=1.0, y=0.0, z=0.0)
+
+        class FakeActor:
+            is_alive = True
+
+            def __init__(self, actor_id: int, x: float, y: float, speed: float):
+                self.id = actor_id
+                self._transform = Transform(x, y)
+                self._speed = speed
+
+            def get_transform(self):
+                return self._transform
+
+            def get_velocity(self):
+                return types.SimpleNamespace(x=self._speed, y=0.0, z=0.0)
+
+        ego = FakeActor(1, 0.0, 0.0, 6.4)
+        blocker = FakeActor(2, 2.5, 3.5, 5.5)
+        striker = FakeActor(3, 18.0, -3.5, 6.7)
+        metadata = {
+            "blocker_1": data_mod.MAActorMeta("blocker_1", "Blocker", 2, "left", 8.0),
+            "attacker_1": data_mod.MAActorMeta("attacker_1", "Striker", 3, "right", 8.0),
+        }
+        scene_summary = {
+            "phase": "prestage",
+            "contract_status": "none",
+            "risk_snapshot": {},
+            "attackers": [
+                {"name": "attacker_1", "role_hint": "Striker", "side": "right"},
+                {"name": "blocker_1", "role_hint": "Blocker", "side": "left"},
+            ],
+            "coordination_geometry": {
+                "blocker_seal_success": True,
+                "blocker_window_ready": True,
+                "blocker_escape_window_ready": True,
+                "striker_cutin_launch_window_ready": True,
+                "striker_cutin_window_ready": True,
+                "striker_raw_cutin_gap_ready": True,
+                "initial_attack_window_valid": True,
+            },
+        }
+        planner_config = {
+            "initializer": {"require_front_blocker_for_slot": False},
+            "seal_escape": {
+                "escape_target_gap_m": 2.5,
+                "escape_gap_bounds_m": [-2.0, 6.0],
+                "hold_duration_s": 8.0,
+            },
+            "cut_in": {
+                "target_gap_bounds_m": [6.0, 9.0],
+                "slot_gap_bounds_m": [6.0, 9.0],
+                "desired_slot_gap_m": 7.0,
+                "start_gap_bounds_m": [8.0, 34.0],
+                "predicted_slot_gap_bounds_m": [6.0, 9.0],
+                "predicted_slot_tolerance_m": 2.0,
+                "lead_in_time_s": 0.6,
+                "min_route_remaining_m": 20.0,
+                "max_lane_change_duration_s": 5.0,
+            },
+            "soft_hints": {"gap_band_targets_m": {"tight": 7.0}},
+            "contract": {"duration_s": 8.0, "duration_bounds_s": [6.0, 12.0]},
+            "constraints": {"max_lateral_accel_mps2": 3.5},
+            "min_plan_horizon_s": 2.0,
+            "max_plan_horizon_s": 6.0,
+            "merge_route_scan_distance_m": 60.0,
+        }
+        context = base_mod.ScenarioContext(
+            world=None,
+            ego_vehicle=ego,
+            actors={"blocker_1": blocker, "attacker_1": striker},
+            actor_metadata=metadata,
+            planner_config=planner_config,
+            ma_config={},
+            sim_time_s=18.0,
+            dt=0.1,
+            phase="prestage",
+            contract=None,
+            risk_snapshot={},
+            adapter_context={"scene_summary": scene_summary, "policy_config": {"planner": planner_config}},
+        )
+        template = cut_mod.CutInTemplate()
+        repaired = template.repair_decision(
+            {"phase": "prestage", "commands": [{"actor_name": "attacker_1", "role": "Striker", "tactic": "gain_lead"}]},
+            context,
+        )
+        assert repaired is not None
+        assert repaired["phase"] == "strike"
+
+        result = template.compile_intent(repaired, context)
+        tactics = {(ir.actor_name, ir.tactic) for ir in result.behaviors}
+        assert result.rejected == []
+        assert result.contract is not None
+        assert ("attacker_1", "cut_in") in tactics
+        assert ("blocker_1", "seal_escape") in tactics
+        blocker_ir = next(ir for ir in result.behaviors if ir.actor_name == "blocker_1")
+        striker_ir = next(ir for ir in result.behaviors if ir.actor_name == "attacker_1")
+        assert blocker_ir.params["escape_blocking"] is True
+        assert blocker_ir.params["target_gap_m"] == 2.5
+        assert striker_ir.params["cutin_launch_window_ready"] is True
+    finally:
+        restore_stubbed_modules(saved)
+
+
+def test_runtime_advances_compress_when_template_reports_launch_events() -> None:
+    runtime_mod, base_mod, saved = load_runtime_with_stubs()
+    extra_modules = [
+        "safebench.scenario.ma.data_types",
+        "safebench.scenario.ma.templates.cut_in",
+    ]
+    saved_extra = {name: sys.modules.get(name) for name in extra_modules}
+    try:
+        data_spec = importlib.util.spec_from_file_location("safebench.scenario.ma.data_types", ROOT / "safebench/scenario/ma/data_types.py")
+        data_mod = importlib.util.module_from_spec(data_spec)
+        sys.modules[data_spec.name] = data_mod
+        data_spec.loader.exec_module(data_mod)
+
+        cut_spec = importlib.util.spec_from_file_location("safebench.scenario.ma.templates.cut_in", ROOT / "safebench/scenario/ma/templates/cut_in.py")
+        cut_mod = importlib.util.module_from_spec(cut_spec)
+        sys.modules[cut_spec.name] = cut_mod
+        cut_spec.loader.exec_module(cut_mod)
+
+        scene_summary = {
+            "phase": "compress",
+            "contract_status": "active",
+            "risk_snapshot": {},
+            "attackers": [
+                {"name": "attacker_1", "role_hint": "Striker", "side": "right"},
+                {"name": "blocker_1", "role_hint": "Blocker", "side": "left"},
+            ],
+            "coordination_geometry": {
+                "blocker_seal_success": True,
+                "blocker_window_ready": True,
+                "striker_cutin_window_ready": False,
+                "striker_cutin_launch_window_ready": False,
+                "striker_raw_cutin_gap_ready": True,
+            },
+        }
+        traces = []
+        template = cut_mod.CutInTemplate()
+        template.build_scene_summary = lambda _context: scene_summary
+
+        class DummyAttackManager:
+            def active_behaviors(self):
+                return {"attacker_1": "slot_sync", "blocker_1": "seal_escape"}
+
+            def behavior_progress(self, _sim_time_s):
+                return {}
+
+            def active_plan_meta(self, _sim_time_s):
+                return {
+                    "attacker_1": {"attack_executable": True, "tactic": "slot_sync"},
+                    "blocker_1": {"attack_executable": True, "tactic": "seal_escape"},
+                }
+
+            def active_plan_snapshot(self):
+                return {}
+
+            def min_active_elapsed_s(self, _sim_time_s):
+                return 1.0
+
+        runtime = object.__new__(runtime_mod.MATemplateRuntimeScenario)
+        runtime.world = None
+        runtime.ego_vehicle = None
+        runtime.actors_by_name = {}
+        runtime.actor_metadata = {}
+        runtime.planner_config = {}
+        runtime.ma_config = {}
+        runtime.template = template
+        runtime.template_runtime = {}
+        runtime.heuristic_adapter = type("Adapter", (), {"prompt_context": lambda self: {}, "planner_overrides": lambda self: {}})()
+        runtime.attack_manager = DummyAttackManager()
+        runtime.trace_writer = type("Trace", (), {"write": lambda self, payload: traces.append(payload)})()
+        runtime.decision_id = 1
+        runtime.last_sim_time_s = 17.62
+        runtime.last_dt = 0.1
+        runtime.current_phase = "compress"
+        runtime.active_contract = {
+            "contract_id": "contract_1",
+            "phase": "compress",
+            "locked": True,
+            "expire_time_s": 30.0,
+            "advance_if": ["blocker_seal_success", "striker_cutin_window_ready"],
+            "abort_if": [],
+            "renegotiate_if": [],
+        }
+        runtime.contract_status = "active"
+        runtime.contract_failure_reason = ""
+        runtime.last_behavior_summary = {}
+        runtime.last_events = set()
+        runtime.step_record = {}
+        runtime.realism_violation_streak = 0
+        runtime.init_failed = False
+        runtime.init_failure_reason = None
+
+        advanced = runtime._advance_phase({})
+        assert advanced == "strike"
+        assert runtime.current_phase == "strike"
+        assert runtime.active_contract["phase"] == "strike"
+        assert runtime.template_runtime["phase_state"]["strike_phase_entered_s"] == 17.62
+        assert any(trace.get("event") == "contract_phase_advanced" and trace.get("to_phase") == "strike" for trace in traces)
+    finally:
+        for name, module in saved_extra.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+        restore_stubbed_modules(saved)
+
+
+def test_runtime_keeps_strike_when_cutin_fallback_but_window_still_ready() -> None:
+    runtime_mod, base_mod, saved = load_runtime_with_stubs()
+    extra_modules = [
+        "safebench.scenario.ma.data_types",
+        "safebench.scenario.ma.templates.cut_in",
+    ]
+    saved_extra = {name: sys.modules.get(name) for name in extra_modules}
+    try:
+        data_spec = importlib.util.spec_from_file_location("safebench.scenario.ma.data_types", ROOT / "safebench/scenario/ma/data_types.py")
+        data_mod = importlib.util.module_from_spec(data_spec)
+        sys.modules[data_spec.name] = data_mod
+        data_spec.loader.exec_module(data_mod)
+
+        cut_spec = importlib.util.spec_from_file_location("safebench.scenario.ma.templates.cut_in", ROOT / "safebench/scenario/ma/templates/cut_in.py")
+        cut_mod = importlib.util.module_from_spec(cut_spec)
+        sys.modules[cut_spec.name] = cut_mod
+        cut_spec.loader.exec_module(cut_mod)
+
+        scene_summary = {
+            "phase": "strike",
+            "contract_status": "active",
+            "risk_snapshot": {},
+            "attackers": [
+                {"name": "attacker_1", "role_hint": "Striker", "side": "right"},
+                {"name": "blocker_1", "role_hint": "Blocker", "side": "left"},
+            ],
+            "coordination_geometry": {
+                "blocker_seal_success": True,
+                "blocker_window_ready": True,
+                "striker_cutin_window_ready": False,
+                "striker_cutin_launch_window_ready": False,
+                "striker_raw_cutin_gap_ready": True,
+            },
+        }
+        traces = []
+        template = cut_mod.CutInTemplate()
+        template.build_scene_summary = lambda _context: scene_summary
+
+        class DummyAttackManager:
+            def active_behaviors(self):
+                return {"blocker_1": "seal_escape"}
+
+            def behavior_progress(self, _sim_time_s):
+                return {}
+
+            def active_plan_meta(self, _sim_time_s):
+                return {
+                    "attacker_1": {"attack_executable": False, "tactic": "cut_in", "execution_mode": "fallback"},
+                    "blocker_1": {"attack_executable": True, "tactic": "seal_escape"},
+                }
+
+            def active_plan_snapshot(self):
+                return {}
+
+            def min_active_elapsed_s(self, _sim_time_s):
+                return 1.0
+
+        runtime = object.__new__(runtime_mod.MATemplateRuntimeScenario)
+        runtime.world = None
+        runtime.ego_vehicle = None
+        runtime.actors_by_name = {}
+        runtime.actor_metadata = {}
+        runtime.planner_config = {}
+        runtime.ma_config = {}
+        runtime.template = template
+        runtime.template_runtime = {}
+        runtime.heuristic_adapter = type("Adapter", (), {"prompt_context": lambda self: {}, "planner_overrides": lambda self: {}})()
+        runtime.attack_manager = DummyAttackManager()
+        runtime.trace_writer = type("Trace", (), {"write": lambda self, payload: traces.append(payload)})()
+        runtime.decision_id = 1
+        runtime.last_sim_time_s = 18.19
+        runtime.last_dt = 0.1
+        runtime.current_phase = "strike"
+        runtime.active_contract = {
+            "contract_id": "contract_1",
+            "phase": "strike",
+            "locked": True,
+            "expire_time_s": 30.0,
+            "advance_if": [],
+            "abort_if": [],
+            "renegotiate_if": ["striker_window_lost", "blocker_seal_lost"],
+        }
+        runtime.contract_status = "active"
+        runtime.contract_failure_reason = ""
+        runtime.last_behavior_summary = {}
+        runtime.last_events = set()
+        runtime.step_record = {}
+        runtime.realism_violation_streak = 0
+        runtime.init_failed = False
+        runtime.init_failure_reason = None
+
+        advanced = runtime._advance_phase({})
+        assert advanced == ""
+        assert runtime.current_phase == "strike"
+        assert runtime.contract_status == "active"
+        assert runtime.contract_failure_reason == ""
+        assert not any(trace.get("event") == "contract_renegotiate_requested" for trace in traces)
+    finally:
+        for name, module in saved_extra.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+        restore_stubbed_modules(saved)
+
+
+def test_executable_cut_in_plan_enters_committed_phase_without_renegotiate() -> None:
+    module_names = [
+        "safebench",
+        "safebench.scenario",
+        "safebench.scenario.ma",
+        "safebench.scenario.ma.data_types",
+        "safebench.scenario.ma.templates",
+        "safebench.scenario.ma.templates.base",
+        "safebench.scenario.ma.templates.cut_in",
+    ]
+    saved = {name: sys.modules.get(name) for name in module_names}
+    try:
+        for name in ["safebench", "safebench.scenario", "safebench.scenario.ma", "safebench.scenario.ma.templates"]:
+            sys.modules[name] = types.ModuleType(name)
+
+        data_spec = importlib.util.spec_from_file_location("safebench.scenario.ma.data_types", ROOT / "safebench/scenario/ma/data_types.py")
+        data_mod = importlib.util.module_from_spec(data_spec)
+        sys.modules[data_spec.name] = data_mod
+        data_spec.loader.exec_module(data_mod)
+
+        base_spec = importlib.util.spec_from_file_location("safebench.scenario.ma.templates.base", ROOT / "safebench/scenario/ma/templates/base.py")
+        base_mod = importlib.util.module_from_spec(base_spec)
+        sys.modules[base_spec.name] = base_mod
+        base_spec.loader.exec_module(base_mod)
+
+        cut_spec = importlib.util.spec_from_file_location("safebench.scenario.ma.templates.cut_in", ROOT / "safebench/scenario/ma/templates/cut_in.py")
+        cut_mod = importlib.util.module_from_spec(cut_spec)
+        sys.modules[cut_spec.name] = cut_mod
+        cut_spec.loader.exec_module(cut_mod)
+
+        template = cut_mod.CutInTemplate()
+        contract = {
+            "contract_id": "contract_1",
+            "phase": "strike",
+            "locked": True,
+            "expire_time_s": 30.0,
+            "advance_if": [],
+            "abort_if": [],
+            "renegotiate_if": ["striker_window_lost", "blocker_seal_lost"],
+        }
+        context = base_mod.ScenarioContext(
+            world=None,
+            ego_vehicle=None,
+            actors={},
+            actor_metadata={},
+            planner_config={},
+            ma_config={},
+            sim_time_s=18.0,
+            dt=0.1,
+            phase="strike",
+            contract=contract,
+            risk_snapshot={},
+            adapter_context={},
+        )
+        ir = types.SimpleNamespace(command_id="cmd", actor_name="attacker_1", tactic="cut_in")
+        plan = types.SimpleNamespace(
+            tactic="cut_in",
+            execution_mode="attack",
+            feasibility_status="normal_feasible",
+            resolved_physical_params={
+                "selected_slot_source": "launch_gap_lateral_commit",
+                "lead_in_time_s": 0.6,
+                "lane_change_duration_s": 4.0,
+            },
+        )
+
+        transition = template.planned_behavior_phase_transition(ir, plan, context)
+        assert transition is not None
+        assert transition["event"] == "cut_in_committed"
+        assert transition["new_phase"] == "cut_in_committed"
+        assert transition["phase_state_updates"]["cut_in_committed_terminal_t_s"] == 4.6
+
+        committed_contract = template.set_contract_phase(contract, transition["new_phase"])
+        template.refresh_contract_lifecycle(committed_contract, transition["new_phase"])
+        assert committed_contract["phase"] == "cut_in_committed"
+        assert committed_contract["renegotiate_if"] == []
+        assert "cut_in_timeout" in committed_contract["abort_if"]
+
+        fallback_plan = types.SimpleNamespace(
+            tactic="cut_in",
+            execution_mode="fallback",
+            feasibility_status="normal_feasible",
+            resolved_physical_params={},
+        )
+        assert template.planned_behavior_phase_transition(ir, fallback_plan, context) is None
+
+        committed_context = base_mod.ScenarioContext(
+            world=None,
+            ego_vehicle=None,
+            actors={},
+            actor_metadata={},
+            planner_config={},
+            ma_config={},
+            sim_time_s=18.5,
+            dt=0.1,
+            phase="cut_in_committed",
+            contract={"contract_id": "contract_1", "phase": "cut_in_committed", "locked": True, "striker_actor": "attacker_1"},
+            risk_snapshot={},
+            adapter_context={},
+        )
+        assert template.should_ignore_shield_replan(
+            [{"actor_name": "blocker_1", "hard": True, "reason": "shield_hard_limit"}],
+            committed_context,
+        )
+        assert not template.should_ignore_shield_replan(
+            [{"actor_name": "attacker_1", "hard": True, "reason": "shield_hard_limit"}],
+            committed_context,
+        )
+        assert not template.should_ignore_shield_replan(
+            [{"actor_name": "blocker_1", "hard": True, "reason": "shield_collision_risk"}],
+            committed_context,
+        )
+        protected_empty_result = types.SimpleNamespace(behaviors=[])
+        protected_context = base_mod.ScenarioContext(
+            world=None,
+            ego_vehicle=None,
+            actors={},
+            actor_metadata={},
+            planner_config={},
+            ma_config={},
+            sim_time_s=18.5,
+            dt=0.1,
+            phase="cut_in_committed",
+            contract={"contract_id": "contract_1", "phase": "cut_in_committed", "locked": True, "striker_actor": "attacker_1"},
+            risk_snapshot={},
+            adapter_context={
+                "contract_status": "active",
+                "active_plan_meta": {"attacker_1": {"tactic": "cut_in", "attack_executable": True}},
+                "active_behaviors": {"attacker_1": "cut_in"},
+            },
+        )
+        assert template.should_recover_after_empty_compile(
+            {"phase": "cut_in_committed", "_ma_phase_protected_from": "prestage"},
+            protected_empty_result,
+            protected_context,
+        ) is False
+        assert template.should_recover_after_empty_compile(
+            {"phase": "cut_in_committed"},
+            protected_empty_result,
+            protected_context,
+        ) is True
+    finally:
+        restore_stubbed_modules(saved)
+
+
+def test_runtime_ignores_committed_blocker_dynamics_shield_replan() -> None:
+    runtime_mod, base_mod, saved = load_runtime_with_stubs()
+    extra_modules = [
+        "safebench.scenario.ma.data_types",
+        "safebench.scenario.ma.templates.cut_in",
+    ]
+    saved_extra = {name: sys.modules.get(name) for name in extra_modules}
+    try:
+        data_spec = importlib.util.spec_from_file_location("safebench.scenario.ma.data_types", ROOT / "safebench/scenario/ma/data_types.py")
+        data_mod = importlib.util.module_from_spec(data_spec)
+        sys.modules[data_spec.name] = data_mod
+        data_spec.loader.exec_module(data_mod)
+
+        cut_spec = importlib.util.spec_from_file_location("safebench.scenario.ma.templates.cut_in", ROOT / "safebench/scenario/ma/templates/cut_in.py")
+        cut_mod = importlib.util.module_from_spec(cut_spec)
+        sys.modules[cut_spec.name] = cut_mod
+        cut_spec.loader.exec_module(cut_mod)
+
+        traces = []
+        phase_actions = []
+
+        class DummyAttackManager:
+            def consume_replan_requests(self):
+                return [{"actor_name": "blocker_1", "hard": True, "reason": "shield_hard_limit", "sim_time_s": 14.79}]
+
+            def active_behaviors(self):
+                return {"attacker_1": "cut_in", "blocker_1": "seal_escape"}
+
+            def behavior_progress(self, _sim_time_s):
+                return {}
+
+            def active_plan_meta(self, _sim_time_s):
+                return {
+                    "attacker_1": {"attack_executable": True, "tactic": "cut_in"},
+                    "blocker_1": {"attack_executable": True, "tactic": "seal_escape"},
+                }
+
+            def active_plan_snapshot(self):
+                return {}
+
+            def min_active_elapsed_s(self, _sim_time_s):
+                return 0.5
+
+        runtime = object.__new__(runtime_mod.MATemplateRuntimeScenario)
+        runtime.world = None
+        runtime.ego_vehicle = None
+        runtime.actors_by_name = {}
+        runtime.actor_metadata = {}
+        runtime.planner_config = {}
+        runtime.ma_config = {}
+        runtime.template = cut_mod.CutInTemplate()
+        runtime.template_runtime = {}
+        runtime.heuristic_adapter = type("Adapter", (), {"prompt_context": lambda self: {}, "planner_overrides": lambda self: {}})()
+        runtime.attack_manager = DummyAttackManager()
+        runtime.trace_writer = type("Trace", (), {"write": lambda self, payload: traces.append(payload)})()
+        runtime.decision_id = 1
+        runtime.last_sim_time_s = 14.79
+        runtime.last_dt = 0.1
+        runtime.current_phase = "cut_in_committed"
+        runtime.active_contract = {
+            "contract_id": "contract_1",
+            "phase": "cut_in_committed",
+            "locked": True,
+            "striker_actor": "attacker_1",
+            "blocker_actor": "blocker_1",
+        }
+        runtime.contract_status = "active"
+        runtime.contract_failure_reason = ""
+        runtime.last_behavior_summary = {}
+        runtime.step_record = {}
+        runtime.realism_violation_streak = 0
+        runtime.shield_hard_replan = False
+        runtime._apply_contract_phase_action = lambda phase, sim_time_s, reason: phase_actions.append((phase, sim_time_s, reason))
+
+        runtime._process_shield_replans(14.79)
+
+        assert any(trace.get("event") == "shield_replan_requested" for trace in traces)
+        ignored = [trace for trace in traces if trace.get("event") == "shield_replan_ignored"]
+        assert ignored
+        assert ignored[-1]["contract"]["striker_actor"] == "attacker_1"
+        assert phase_actions == []
+        assert runtime.shield_hard_replan is False
+    finally:
+        for name, module in saved_extra.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+        restore_stubbed_modules(saved)
+
+
+def test_runtime_ignores_new_attack_actions_after_danger_achieved() -> None:
+    runtime_mod, _base_mod, saved = load_runtime_with_stubs()
+    try:
+        traces = []
+        handled = []
+        recovered = []
+
+        class DummyTemplate:
+            initial_phase = "prestage"
+
+            def is_recover_behavior(self, behavior):
+                return behavior == "recover"
+
+            def initial_scene_window_lost_trace_events(self):
+                return []
+
+            def compute_metrics(self, _context):
+                return {}
+
+            def compute_events(self, _context):
+                return set()
+
+            def contract_id(self, _contract):
+                return ""
+
+            def post_phase_advance_action(self, _advanced_to, _context):
+                return None
+
+            def should_issue_realism_recover(self, _context):
+                return False
+
+        class DummyAttackManager:
+            def tick(self, _sim_time_s, _dt):
+                pass
+
+            def active_behaviors(self):
+                return {"attacker_1": "gain_lead"}
+
+            def behavior_progress(self, _sim_time_s):
+                return {}
+
+            def active_plan_meta(self, _sim_time_s):
+                return {}
+
+            def active_plan_snapshot(self):
+                return {}
+
+            def active_command_ids(self):
+                return ["active_cmd"]
+
+            def min_active_elapsed_s(self, _sim_time_s):
+                return 1.0
+
+            def consume_replan_requests(self):
+                return []
+
+        runtime = object.__new__(runtime_mod.MATemplateRuntimeScenario)
+        runtime._timebase = lambda: (21.0, 0.1)
+        runtime.env_id = 0
+        runtime.init_action = {"episode_id": 1}
+        runtime.ma_config = {"decision_interval_s": 1.0}
+        runtime.planner_config = {}
+        runtime.tick_count = 0
+        runtime.last_sim_time_s = 0.0
+        runtime.last_dt = 0.1
+        runtime.last_action_step = -1
+        runtime.last_decision_id = -1
+        runtime.decision_id = 0
+        runtime.init_failed = False
+        runtime.init_failure_reason = None
+        runtime.danger_achieved = True
+        runtime.world = None
+        runtime.ego_vehicle = None
+        runtime.template = DummyTemplate()
+        runtime.template_runtime = {}
+        runtime.heuristic_adapter = type("Adapter", (), {"prompt_context": lambda self: {}, "planner_overrides": lambda self: {}, "update_step": lambda self, *args: None})()
+        runtime.attack_manager = DummyAttackManager()
+        runtime.trace_writer = type("Trace", (), {"write": lambda self, payload: traces.append(payload)})()
+        runtime.actors_by_name = {}
+        runtime.actor_metadata = {}
+        runtime.active_contract = None
+        runtime.contract_status = "none"
+        runtime.contract_failure_reason = ""
+        runtime.current_phase = "prestage"
+        runtime.last_behavior_summary = {}
+        runtime.last_events = set()
+        runtime.step_record = {}
+        runtime.realism_violation_streak = 0
+        runtime.initial_scene_window = {}
+        runtime.initial_scene_window_lost_traced = True
+        runtime.last_verifier_status = "danger_achieved"
+        runtime.last_rejected = []
+        runtime.last_recover_reason = None
+        runtime.shield_hard_replan = False
+        runtime._handle_action = lambda action, sim_time_s: handled.append((action, sim_time_s))
+        runtime._request_recover = lambda reason, sim_time_s: recovered.append((reason, sim_time_s))
+
+        runtime.update_behavior({"decision_due": True, "decision_id": 44, "step": 44, "phase": "compress", "commands": [{"tactic": "slot_sync"}]})
+
+        assert handled == []
+        assert recovered == [("post_danger_achieved", 21.0)]
+        assert any(trace.get("event") == "post_danger_action_ignored" and trace.get("action_phase") == "compress" for trace in traces)
+    finally:
+        restore_stubbed_modules(saved)
+
+
+def test_committed_cut_in_success_metrics_advance_to_brake_pulse() -> None:
+    module_names = [
+        "carla",
+        "safebench",
+        "safebench.scenario",
+        "safebench.scenario.ma",
+        "safebench.scenario.ma.data_types",
+        "safebench.scenario.ma.metrics",
+        "safebench.scenario.ma.templates",
+        "safebench.scenario.ma.templates.base",
+        "safebench.scenario.ma.templates.cut_in",
+        "safebench.scenario.scenario_manager",
+        "safebench.scenario.scenario_manager.carla_data_provider",
+    ]
+    saved = {name: sys.modules.get(name) for name in module_names}
+    try:
+        class FakeLocation:
+            def __init__(self, x: float, y: float = 0.0, z: float = 0.0):
+                self.x = x
+                self.y = y
+                self.z = z
+
+            def distance(self, other) -> float:
+                return ((self.x - other.x) ** 2 + (self.y - other.y) ** 2 + (self.z - other.z) ** 2) ** 0.5
+
+        carla_mod = types.ModuleType("carla")
+        carla_mod.LaneType = type("LaneType", (), {"Driving": "Driving"})
+        carla_mod.Location = FakeLocation
+        sys.modules["carla"] = carla_mod
+        for name in [
+            "safebench",
+            "safebench.scenario",
+            "safebench.scenario.ma",
+            "safebench.scenario.ma.templates",
+            "safebench.scenario.scenario_manager",
+        ]:
+            package = types.ModuleType(name)
+            package.__path__ = []
+            sys.modules[name] = package
+
+        class FakeTransform:
+            def __init__(self, x: float, y: float):
+                self.location = FakeLocation(x, y, 0.0)
+                self.rotation = types.SimpleNamespace(yaw=0.0)
+
+            def get_forward_vector(self):
+                return types.SimpleNamespace(x=1.0, y=0.0, z=0.0)
+
+        class FakeWaypoint:
+            road_id = 1
+            lane_id = 3
+            lane_width = 3.5
+            lane_type = carla_mod.LaneType.Driving
+            is_junction = False
+
+            def __init__(self):
+                self.transform = types.SimpleNamespace(
+                    location=FakeLocation(0.0, 0.0, 0.0),
+                    rotation=types.SimpleNamespace(yaw=0.0),
+                )
+
+        class FakeMap:
+            def get_waypoint(self, _location, **_kwargs):
+                return FakeWaypoint()
+
+        class FakeActor:
+            is_alive = True
+
+            def __init__(self, actor_id: int, x: float, y: float, speed: float):
+                self.id = actor_id
+                self._transform = FakeTransform(x, y)
+                self._speed = speed
+                self._accel_x = 0.0
+
+            def get_transform(self):
+                return self._transform
+
+            def get_velocity(self):
+                return types.SimpleNamespace(x=self._speed, y=0.0, z=0.0)
+
+            def get_acceleration(self):
+                return types.SimpleNamespace(x=self._accel_x, y=0.0, z=0.0)
+
+            def get_angular_velocity(self):
+                return types.SimpleNamespace(z=0.0)
+
+            def get_control(self):
+                return types.SimpleNamespace(steer=0.0)
+
+        provider_module = types.ModuleType("safebench.scenario.scenario_manager.carla_data_provider")
+        provider_module.CarlaDataProvider = type("CarlaDataProvider", (), {
+            "get_map": staticmethod(lambda: FakeMap()),
+            "get_velocity": staticmethod(lambda actor: actor._speed),
+        })
+        sys.modules["safebench.scenario.scenario_manager.carla_data_provider"] = provider_module
+
+        for module_name, relative_path in (
+            ("safebench.scenario.ma.data_types", "safebench/scenario/ma/data_types.py"),
+            ("safebench.scenario.ma.templates.base", "safebench/scenario/ma/templates/base.py"),
+            ("safebench.scenario.ma.metrics", "safebench/scenario/ma/metrics.py"),
+            ("safebench.scenario.ma.templates.cut_in", "safebench/scenario/ma/templates/cut_in.py"),
+        ):
+            spec = importlib.util.spec_from_file_location(module_name, ROOT / relative_path)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
+            spec.loader.exec_module(module)
+
+        metrics_mod = sys.modules["safebench.scenario.ma.metrics"]
+        base_mod = sys.modules["safebench.scenario.ma.templates.base"]
+        cut_mod = sys.modules["safebench.scenario.ma.templates.cut_in"]
+
+        ego = FakeActor(1, 0.0, 0.0, 8.0)
+        striker = FakeActor(2, 9.0, 0.0, 6.5)
+        active_behaviors = {"attacker_1": "cut_in"}
+        active_plan_meta = {
+            "attacker_1": {
+                "attack_executable": True,
+                "tactic": "cut_in",
+                "command_id": "attacker_1:cut_in:committed",
+            }
+        }
+        record = metrics_mod.MARiskMetrics({"cutin_success_gap_m": 12.0}).update(
+            ego,
+            {"attacker_1": striker},
+            active_behaviors,
+            sim_time_s=21.0,
+            dt=0.1,
+            active_plan_meta=active_plan_meta,
+        )
+        assert record["ma_event_cutin_success"] is True
+
+        transition_metrics = metrics_mod.MARiskMetrics({
+            "max_abs_longitudinal_accel_mps2": 6.0,
+            "max_abs_jerk_mps3": 8.0,
+            "command_transition_warmup_frames": 3,
+        })
+        transition_striker = FakeActor(3, 0.0, 0.0, 6.5)
+        transition_meta = dict(active_plan_meta["attacker_1"])
+        transition_meta["command_id"] = "cmd_a"
+        transition_metrics.update(
+            ego,
+            {"attacker_1": transition_striker},
+            active_behaviors,
+            sim_time_s=30.0,
+            dt=0.1,
+            active_plan_meta={"attacker_1": transition_meta},
+        )
+        transition_meta["command_id"] = "cmd_b"
+        warmup_records = []
+        for idx, accel in enumerate([25.0, -20.0, 2.0], start=1):
+            transition_striker._accel_x = accel
+            warmup_records.append(transition_metrics.update(
+                ego,
+                {"attacker_1": transition_striker},
+                active_behaviors,
+                sim_time_s=30.0 + idx * 0.1,
+                dt=0.1,
+                active_plan_meta={"attacker_1": transition_meta},
+            ))
+        transition_striker._accel_x = 2.0
+        settled_record = transition_metrics.update(
+            ego,
+            {"attacker_1": transition_striker},
+            active_behaviors,
+            sim_time_s=30.4,
+            dt=0.1,
+            active_plan_meta={"attacker_1": transition_meta},
+        )
+        assert all(record["ma_realism_violation_step"] is False for record in warmup_records)
+        assert all(record["ma_actor_realism_raw"]["attacker_1"]["warmup_excluded"] is True for record in warmup_records)
+        assert settled_record["ma_realism_violation_step"] is False
+        assert settled_record["ma_actor_realism_raw"]["attacker_1"]["warmup_excluded"] is False
+        assert settled_record["ma_episode_realism_violation_count"] == 0
+
+        template = cut_mod.CutInTemplate()
+        template.build_scene_summary = lambda _context: {"coordination_geometry": {}}
+        context = base_mod.ScenarioContext(
+            world=None,
+            ego_vehicle=ego,
+            actors={"attacker_1": striker},
+            actor_metadata={},
+            planner_config={"cut_in": {"committed_timeout_s": 5.5}},
+            ma_config={},
+            sim_time_s=21.0,
+            dt=0.1,
+            phase="cut_in_committed",
+            contract={"contract_id": "contract_1", "phase": "cut_in_committed", "locked": True},
+            risk_snapshot=record,
+            adapter_context={
+                "active_behaviors": active_behaviors,
+                "active_plan_meta": active_plan_meta,
+                "behavior_progress": {"attacker_1": {"tactic": "cut_in", "elapsed_s": 1.3}},
+            },
+        )
+        events = template.evaluate_events(record, context)
+        assert "cutin_success" in events
+        brake_ready_context = base_mod.ScenarioContext(
+            world=None,
+            ego_vehicle=ego,
+            actors={"attacker_1": striker},
+            actor_metadata={},
+            planner_config={"front_brake": {"min_gap_m": 4.0, "max_gap_m": 15.0}},
+            ma_config={},
+            sim_time_s=21.0,
+            dt=0.1,
+            phase="cut_in_committed",
+            contract={"contract_id": "contract_1", "phase": "cut_in_committed", "locked": True, "striker_actor": "attacker_1"},
+            risk_snapshot=record,
+            adapter_context={
+                "scene_summary": {
+                    "phase": "cut_in_committed",
+                    "contract_status": "active",
+                    "risk_snapshot": {},
+                    "coordination_geometry": {},
+                    "attackers": [
+                        {"name": "attacker_1", "lateral_relation_to_ego": "same_lane", "longitudinal_gap_to_ego_m": 9.0},
+                        {"name": "blocker_1", "role_hint": "Blocker"},
+                    ],
+                },
+                "active_plan_meta": {"attacker_1": {"tactic": "cut_in", "attack_executable": True, "fallback_reason": ""}},
+            },
+        )
+        brake_ready_decision = template.fallback_decision(brake_ready_context)
+        assert any(command.get("actor_name") == "attacker_1" and command.get("tactic") == "front_brake" for command in brake_ready_decision["commands"])
+        transition = template.committed_phase_transition(context.phase, events)
+        assert transition == {
+            "kind": "advance",
+            "new_phase": "brake_pulse",
+            "matched_events": ["cutin_success"],
+        }
+        early_context = base_mod.ScenarioContext(
+            world=None,
+            ego_vehicle=ego,
+            actors={"attacker_1": striker},
+            actor_metadata={},
+            planner_config={"cut_in": {"committed_danger_grace_s": 1.2}},
+            ma_config={},
+            sim_time_s=21.2,
+            dt=0.1,
+            phase="cut_in_committed",
+            contract={"contract_id": "contract_1", "phase": "cut_in_committed", "locked": True},
+            risk_snapshot=record,
+            adapter_context={
+                "phase_state": {"cut_in_plan_set_s": 21.0, "cut_in_committed_terminal_t_s": 4.6},
+                "behavior_progress": {"attacker_1": {"tactic": "cut_in", "elapsed_s": 0.2}},
+            },
+        )
+        assert template.committed_phase_transition("cut_in_committed", {"near_miss"}, early_context) is None
+        trace_regression_context = base_mod.ScenarioContext(
+            world=None,
+            ego_vehicle=ego,
+            actors={"attacker_1": striker},
+            actor_metadata={},
+            planner_config={"cut_in": {"committed_danger_grace_s": 1.2}},
+            ma_config={},
+            sim_time_s=22.0,
+            dt=0.1,
+            phase="cut_in_committed",
+            contract={"contract_id": "contract_1", "phase": "cut_in_committed", "locked": True},
+            risk_snapshot=record,
+            adapter_context={
+                "phase_state": {"cut_in_plan_set_s": 21.0, "cut_in_committed_terminal_t_s": 4.6},
+                "behavior_progress": {"attacker_1": {"tactic": "cut_in", "elapsed_s": 1.0}},
+            },
+        )
+        assert template.committed_phase_transition("cut_in_committed", {"near_miss"}, trace_regression_context) is None
+        long_lane_change_context = base_mod.ScenarioContext(
+            world=None,
+            ego_vehicle=ego,
+            actors={"attacker_1": striker},
+            actor_metadata={},
+            planner_config={"cut_in": {"committed_danger_grace_s": 1.2, "committed_danger_min_elapsed_ratio": 0.35}},
+            ma_config={},
+            sim_time_s=22.8,
+            dt=0.1,
+            phase="cut_in_committed",
+            contract={"contract_id": "contract_1", "phase": "cut_in_committed", "locked": True},
+            risk_snapshot=record,
+            adapter_context={
+                "phase_state": {"cut_in_plan_set_s": 21.0, "cut_in_committed_terminal_t_s": 5.2},
+                "behavior_progress": {"attacker_1": {"tactic": "cut_in", "elapsed_s": 1.3}},
+                "active_plan_meta": {"attacker_1": {"tactic": "cut_in", "planner_status": "planned", "fallback_reason": "", "attack_executable": True}},
+            },
+        )
+        assert template.committed_phase_transition("cut_in_committed", {"near_miss"}, long_lane_change_context) is None
+        assert template.committed_phase_transition("cut_in_committed", {"near_miss"}, context) is None
+        replanned_context = base_mod.ScenarioContext(
+            world=None,
+            ego_vehicle=ego,
+            actors={"attacker_1": striker},
+            actor_metadata={},
+            planner_config={"cut_in": {"committed_danger_grace_s": 1.2}},
+            ma_config={},
+            sim_time_s=22.8,
+            dt=0.1,
+            phase="cut_in_committed",
+            contract={"contract_id": "contract_1", "phase": "cut_in_committed", "locked": True},
+            risk_snapshot=record,
+            adapter_context={
+                "phase_state": {"cut_in_plan_set_s": 21.0, "cut_in_committed_terminal_t_s": 4.6},
+                "behavior_progress": {"attacker_1": {"tactic": "cut_in", "elapsed_s": 0.1, "duration_s": 4.6}},
+                "active_plan_meta": {"attacker_1": {"tactic": "cut_in", "planner_status": "planned", "fallback_reason": "", "attack_executable": True}},
+            },
+        )
+        assert template.committed_phase_transition("cut_in_committed", {"near_miss"}, replanned_context) is None
+        fallback_context = base_mod.ScenarioContext(
+            world=None,
+            ego_vehicle=ego,
+            actors={"attacker_1": striker},
+            actor_metadata={},
+            planner_config={"cut_in": {"committed_danger_grace_s": 0.0}},
+            ma_config={},
+            sim_time_s=22.8,
+            dt=0.1,
+            phase="cut_in_committed",
+            contract={"contract_id": "contract_1", "phase": "cut_in_committed", "locked": True},
+            risk_snapshot=record,
+            adapter_context={
+                "phase_state": {"cut_in_plan_set_s": 21.0, "cut_in_committed_terminal_t_s": 4.6},
+                "behavior_progress": {"attacker_1": {"tactic": "cut_in", "elapsed_s": 2.0}},
+                "active_plan_meta": {"attacker_1": {"tactic": "cut_in", "planner_status": "fallback", "fallback_reason": "no_normal_feasible_attack_candidate", "attack_executable": True}},
+            },
+        )
+        assert template.committed_phase_transition("cut_in_committed", {"near_miss"}, fallback_context) is None
+        assert template.committed_phase_transition("brake_pulse", {"near_miss"}) == {
+            "kind": "danger",
+            "new_phase": "recover",
+            "matched_events": ["near_miss"],
+            "failure_reason": "near_miss",
+            "recover_reason": "danger_achieved_near_miss",
+        }
+    finally:
+        restore_stubbed_modules(saved)
+
+
 def test_scene_summary_allowed_semantics_are_template_driven() -> None:
     scene_text = read(ROOT / "safebench/scenario/ma/scene_summary.py")
     template_text = read(ROOT / "safebench/scenario/ma/templates/cut_in.py")
@@ -1526,6 +3320,7 @@ def test_llm_context_is_compact_and_usage_is_traced() -> None:
         "ma_llm_message_pool_entries",
         "active_plan",
         "striker_raw_cutin_gap_ready",
+        "striker_cutin_launch_window_ready",
     ]:
         assert key in llm_text + config_text
     assert "ma_llm_message_pool_entries: 12" in config_text
@@ -1614,6 +3409,7 @@ def test_time_parameterized_trajectory_contract_is_explicit() -> None:
         "attack_candidate_budget_ms",
         "fallback_budget_ms",
         "time.perf_counter()",
+        "duration_offsets = [0.0, 0.6, 1.2, 1.8, 2.4, 3.0]",
         "_terminal_station_reachable",
         "_replanning_prefix",
         "_shift_trajectory_time",
@@ -1646,8 +3442,25 @@ def test_time_parameterized_trajectory_contract_is_explicit() -> None:
         assert key in attack_text
     assert "target_speed_mps = self._apply_phase_speed_floor(plan, plan.target_speed_mps(elapsed))" in attack_text
     assert "if not is_attack_executable(plan):" in attack_text
+    assert 'if plan.tactic == "cut_in":' in attack_text
+    assert 'phase in ("compress", "strike") and plan.tactic == "slot_sync"' in attack_text
+    assert 'phase in ("compress", "strike", "cut_in_committed")' in attack_text
+    assert 'and plan.tactic == "seal_escape"' in attack_text
+    assert '"escape_blocking", False' in attack_text
+    assert '"escape_compress_min_speed_mps"' in attack_text
+    assert '"committed_min_speed_mps"' in attack_text
     assert 'phase != "prestage" or plan.tactic not in ("gain_lead", "seal_escape")' in attack_text
+    assert (
+        "control = self._apply_bootstrap_launch_control(name, actor, plan, control, target_speed_mps, current_speed_mps, elapsed)\n"
+        "            control = self._apply_safety_shield(name, actor, plan, control, sim_time_s, dt)\n"
+        "            control = self._apply_control_rate_limits(name, control, dt)"
+    ) in attack_text
+    assert "desired_throttle > 0.02 and previous[\"brake\"] > 0.02" in attack_text
+    assert "desired_brake > 0.02 and previous[\"throttle\"] > 0.02" in attack_text
+    assert "self.last_controls.pop(plan.actor_name, None)" in attack_text
+    assert attack_text.index("self.last_controls.pop(plan.actor_name, None)") < attack_text.index("self.filtered_dynamics.pop(plan.actor_name, None)")
     assert attack_text.index("actuation_velocity_assist_debug_allow_set_target_velocity") < attack_text.index("actor.set_target_velocity")
+    assert 'str(ir.params.get("phase", "") or "") in ("compress", "strike", "cut_in_committed")' in planner_text
     for key in [
         "def _bootstrap_initial_speed_floor",
         "def _bootstrap_start_speed",
@@ -1664,19 +3477,55 @@ def test_cut_in_configs_enable_attack_velocity_assist() -> None:
     ]:
         config_text = read(path)
         assert "actuation_velocity_assist_enabled: true" in config_text
-        assert "actuation_velocity_assist_debug_allow_set_target_velocity: true" in config_text
+        assert "actuation_velocity_assist_debug_allow_set_target_velocity: false" in config_text
+        assert "actuation_velocity_assist_max_jerk_mps3: 8.0" in config_text
         assert "actuation_velocity_assist_stall_recovery_enabled: true" in config_text
-        assert "actuation_velocity_assist_stall_recovery_min_speed_mps: 3.0" in config_text
+        assert "actuation_velocity_assist_stall_recovery_allow_set_target_velocity: true" in config_text
+        assert "actuation_velocity_assist_stall_recovery_max_accel_mps2: 2.0" in config_text
+        assert "actuation_velocity_assist_stall_recovery_max_jerk_mps3: 4.0" in config_text
+        assert "actuation_velocity_assist_stall_recovery_release_speed_mps: 3.0" in config_text
+        assert "actuation_velocity_assist_stall_recovery_max_target_lead_mps: 3.0" in config_text
+        assert "actuation_velocity_assist_stall_recovery_min_speed_mps: 0.0" in config_text
+        assert "actuation_velocity_assist_shield_max_jerk_mps3: 8.0" in config_text
+        assert "striker_far_min_speed_mps: 5.5" in config_text
+        assert "striker_far_yield_margin_mps: 0.4" in config_text
+        assert "committed_min_speed_mps: 5.5" in config_text
+        assert "launch_min_speed_mps: 5.0" in config_text
+        assert "hold_active_plan_during_committed: true" in config_text
+        assert "committed_plan_lock_s: 6.5" in config_text
+        assert "suppress_dynamics_only_shield_replan: true" in config_text
 
 
 def test_velocity_assist_stall_recovery_is_scoped_to_active_attack_window() -> None:
     attack_text = read(ROOT / "safebench/scenario/ma/attack_manager.py")
     assert "def _velocity_assist_stall_recovery_allowed" in attack_text
-    assert 'phase not in ("compress", "strike", "cut_in_committed")' in attack_text
-    assert 'plan.tactic not in ("slot_sync", "gain_lead", "seal_escape")' in attack_text
+    assert 'plan.tactic != "cut_in" and phase not in ("prestage", "compress", "strike", "cut_in_committed")' in attack_text
+    assert 'plan.tactic not in ("slot_sync", "gain_lead", "seal_escape", "cut_in")' in attack_text
     assert "not is_attack_executable(plan)" in attack_text
+    assert 'stall_allowed = bool(self.config.get("actuation_velocity_assist_stall_recovery_allow_set_target_velocity", True)) and stall_recovery' in attack_text
+    assert 'if not debug_allowed and not stall_allowed:' in attack_text
+    assert '"speed_mps": float(current_speed_mps)' in attack_text
+    assert 'carry_speed = state.get("speed_mps")' in attack_text
+    assert 'previous_speed = float(state.get("speed_mps", current_speed_mps))' in attack_text
+    assert 'actuation_velocity_assist_stall_recovery_max_target_lead_mps' in attack_text
     assert "front_gap is not None and front_gap <= float(self.config.get(\"actuation_velocity_assist_stall_front_gap_m\", 8.0))" in attack_text
     assert '"stall_recovery": bool(stall_recovery)' in attack_text
+    assert '"accel_cmd_mps2": accel_cmd' in attack_text
+    assert '"max_jerk_mps3": max_jerk' in attack_text
+    assert '"reason": "shield_intervention"' in attack_text
+
+
+def test_committed_cut_in_ignores_blocker_dynamics_only_shield_replan() -> None:
+    runtime_text = read(ROOT / "safebench/scenario/ma/runtime.py")
+    base_text = read(ROOT / "safebench/scenario/ma/templates/base.py")
+    template_text = read(ROOT / "safebench/scenario/ma/templates/cut_in.py")
+    assert "MA_RUNTIME_BUILD_TAG" in runtime_text
+    assert '"ma_runtime_build_tag": MA_RUNTIME_BUILD_TAG' in runtime_text
+    assert "self.template.should_ignore_shield_replan(requests, context)" in runtime_text
+    assert "def should_ignore_shield_replan" in base_text
+    assert "context.phase != \"cut_in_committed\"" in template_text
+    assert "item.get(\"actor_name\") == striker_actor" in template_text
+    assert "item.get(\"reason\") != \"shield_hard_limit\"" in template_text
 
 
 def test_attack_execution_mode_gates_state_and_metrics() -> None:
@@ -1770,6 +3619,36 @@ def test_missing_scene_summary_does_not_consume_decision_gate() -> None:
     assert "if step < 5" not in text
     assert '"sim_time_s"] = self.last_sim_time_s' in scenario_text
     assert 'summary["sim_time_s"]' in text
+
+
+def test_cut_in_planning_config_is_not_overly_conservative() -> None:
+    config_text = read(ROOT / "safebench/scenario/config/ma_cut_in.yaml")
+    all_routes_text = read(ROOT / "safebench/scenario/config/ma_cut_in_all_routes.yaml")
+    for text in (config_text, all_routes_text):
+        for key in [
+            "planning_time_budget_ms: 420",
+            "attack_candidate_budget_ms: 340",
+            "fallback_budget_ms: 60",
+            "collision_dt_s: 0.04",
+            "planning_limit_ratio: 1.0",
+            "max_runtime_lane_change_s: 6.5",
+            "max_front_wheel_angle_rate_degps: 180.0",
+            "max_lateral_jerk_mps3: 8.0",
+            "max_abs_curvature_rate_s: 0.18",
+            "max_abs_curvature_rate_t: 1.2",
+            "committed_danger_grace_s: 1.2",
+            "committed_danger_min_elapsed_ratio: 0.45",
+            "striker_far_min_speed_mps: 5.5",
+            "striker_far_yield_margin_mps: 0.4",
+            "committed_min_speed_mps: 5.5",
+            "lane_change_duration_bounds_s: [2.8, 6.5]",
+            "max_lane_change_duration_s: 6.5",
+            "allow_aggressive_rate_limited_plan: true",
+        ]:
+            assert key in text
+    planner_text = read(ROOT / "safebench/scenario/ma/planner.py")
+    assert '"longitudinal_accel_mps2_limit"' in planner_text
+    assert "if reasons & dynamic_reasons:" in planner_text
 
 
 def test_sac_checkpoint_loads_on_cpu() -> None:

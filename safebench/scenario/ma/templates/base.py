@@ -340,10 +340,18 @@ class MAScenarioTemplate:
     def post_phase_advance_action(self, advanced_to: str, context: ScenarioContext) -> Optional[Dict[str, Any]]:
         return None
 
+    def should_ignore_shield_replan(self, requests: List[Dict[str, Any]], context: ScenarioContext) -> bool:
+        return False
+
     def committed_phase_events(self) -> Dict[str, List[str]]:
         return {"success": [], "danger": []}
 
-    def committed_phase_transition(self, current_phase: str, events: set) -> Optional[Dict[str, Any]]:
+    def committed_phase_transition(
+        self,
+        current_phase: str,
+        events: set,
+        context: Optional[ScenarioContext] = None,
+    ) -> Optional[Dict[str, Any]]:
         return None
 
     def on_phase_advanced(self, old_phase: str, new_phase: str, context: ScenarioContext) -> Dict[str, Any]:

@@ -414,18 +414,27 @@ class TrajectoryValidator:
             candidate_score=score,
             checked_points=len(points),
             collision_checks=collision_checks[0],
+            collision_actor_id=collision_checks[2],
         )
 
     def _footprint_on_allowed_road(self, actor: Any, transform: carla.Transform, lane_keys: set) -> bool:
+        margin = float(self.trajectory_config.get("footprint_lane_tolerance_m", 0.35))
         for corner in vehicle_footprint(actor, transform):
             waypoint = self.carla_map.get_waypoint(corner, project_to_road=False, lane_type=carla.LaneType.Driving)
-            if waypoint is None or (int(waypoint.road_id), int(waypoint.lane_id)) not in lane_keys:
+            if waypoint is not None and (int(waypoint.road_id), int(waypoint.lane_id)) in lane_keys:
+                continue
+            projected = self.carla_map.get_waypoint(corner, project_to_road=True, lane_type=carla.LaneType.Driving)
+            if projected is None or (int(projected.road_id), int(projected.lane_id)) not in lane_keys:
+                return False
+            lane_width = max(float(getattr(projected, "lane_width", 3.5)), 0.1)
+            center = projected.transform.location
+            if corner.distance(center) > lane_width * 0.5 + margin:
                 return False
         return True
 
     def _collision_checks(self, points, actor, vehicles, deadline):
         if not points or not vehicles:
-            return 0, ""
+            return 0, "", None
         collision_dt = max(0.02, float(self.trajectory_config.get("collision_dt_s", 0.025)))
         broad_margin = float(self.trajectory_config.get("collision_broad_phase_margin_m", 3.0))
         checks = 0
@@ -433,7 +442,7 @@ class TrajectoryValidator:
         t = 0.0
         while t <= duration + 1e-6:
             if deadline is not None and time.perf_counter() >= deadline:
-                return checks, "collision_check_time_budget_exhausted"
+                    return checks, "collision_check_time_budget_exhausted", None
             point_transform = interpolate_trajectory_transform(points, t)
             for vehicle in vehicles:
                 predicted = predict_actor_transform_on_lane(vehicle, t)
@@ -443,9 +452,9 @@ class TrajectoryValidator:
                     continue
                 checks += 1
                 if obb_overlap(actor, point_transform, vehicle, predicted):
-                    return checks, "predicted_collision"
+                    return checks, "predicted_collision", int(getattr(vehicle, "id", -1))
             t += collision_dt
-        return checks, ""
+        return checks, "", None
 
 
 def nearest_trajectory_point(points: Sequence[TrajectoryPoint], t: float) -> TrajectoryPoint:

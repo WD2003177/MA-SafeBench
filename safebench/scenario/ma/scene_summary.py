@@ -149,6 +149,8 @@ def _predicted_cutin_geometry(striker_item: Dict[str, Any], blocker_gap: Optiona
     horizon = lead_in_s + lane_change_s
     current_gap = float(striker_item.get("longitudinal_gap_to_ego_m") or 0.0)
     striker_speed = float(striker_item.get("speed_mps") or 0.0)
+    launch_min_speed = float(cut_cfg.get("launch_min_speed_mps", cut_cfg.get("committed_min_speed_mps", 5.5)))
+    launch_speed_ready = striker_speed >= launch_min_speed
     predicted_gap = current_gap - max(0.0, ego_speed - striker_speed) * horizon
     start_bounds = bounds.get("cutin_start_window_m", [10.0, 34.0])
     predicted_bounds = cut_cfg.get("predicted_slot_gap_bounds_m", desired_bounds)
@@ -170,15 +172,22 @@ def _predicted_cutin_geometry(striker_item: Dict[str, Any], blocker_gap: Optiona
             and final_slot >= float(desired_bounds[0])
             and (blocker_gap - final_slot) >= min_clearance
         )
-    ready = bool(
+    launch_window_ready = bool(
         striker_item.get("striker_in_adjacent_lane")
         and striker_item.get("same_road_as_ego")
         and float(start_bounds[0]) <= current_gap <= float(start_bounds[1])
-        and (actual_slot_gap_in_bounds or predicted_in_bounds or predicted_close_to_final)
+        and launch_speed_ready
         and slot_open
+    )
+    ready = bool(
+        launch_window_ready
+        and (actual_slot_gap_in_bounds or predicted_in_bounds or predicted_close_to_final)
     )
     return {
         "predicted_cutin_slot_ready": ready,
+        "cutin_launch_window_ready": launch_window_ready,
+        "cutin_launch_speed_ready": launch_speed_ready,
+        "cutin_launch_min_speed_mps": launch_min_speed,
         "desired_slot_gap_m": desired_slot,
         "final_slot_gap_m": final_slot,
         "predicted_slot_gap_m": predicted_gap,
@@ -430,14 +439,17 @@ def build_scene_summary(
             "ego_front_clear": ego_front_clear,
             "ego_front_gap_m": ego_front_gap,
             "min_blocker_clearance_m": min_blocker_clearance,
-            "striker_cutin_window_ready": any(item.get("predicted_cutin_slot_ready") for item in attackers),
+            "striker_cutin_window_ready": any(item.get("cutin_launch_window_ready") for item in attackers),
+            "striker_cutin_launch_window_ready": any(item.get("cutin_launch_window_ready") for item in attackers),
             "predicted_cutin_slot_ready": any(item.get("predicted_cutin_slot_ready") for item in attackers),
             "desired_slot_gap_m": next((item.get("desired_slot_gap_m") for item in attackers if item.get("role_hint") == "Striker"), None),
             "final_slot_gap_m": next((item.get("final_slot_gap_m") for item in attackers if item.get("role_hint") == "Striker"), None),
             "predicted_slot_gap_m": next((item.get("predicted_slot_gap_m") for item in attackers if item.get("role_hint") == "Striker"), None),
             "blocker_clearance_m": next((item.get("blocker_clearance_m") for item in attackers if item.get("role_hint") == "Striker"), None),
             "slot_adjust_reason": next((item.get("slot_adjust_reason") for item in attackers if item.get("role_hint") == "Striker"), None),
-            "striker_raw_cutin_gap_ready": any(item["striker_in_cutin_window"] for item in attackers),
+            "striker_raw_cutin_gap_ready": any(item["striker_in_cutin_window"] and item.get("cutin_launch_speed_ready") for item in attackers),
+            "striker_cutin_speed_ready": any(item.get("cutin_launch_speed_ready") for item in attackers if item.get("role_hint") == "Striker"),
+            "striker_cutin_min_speed_mps": next((item.get("cutin_launch_min_speed_mps") for item in attackers if item.get("role_hint") == "Striker"), None),
         },
         "risk_snapshot": risk_snapshot,
         "allowed_phases": allowed_phases,

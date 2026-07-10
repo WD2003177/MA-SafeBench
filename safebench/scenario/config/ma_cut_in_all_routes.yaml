@@ -48,11 +48,12 @@ ma_initial_attack_bootstrap_enabled: true
 ma_initial_attack_bootstrap_apply_control_immediately: true
 ma_initial_attack_bootstrap_striker_tactic: 'slot_sync'
 ma_repair_initial_observe_to_contract: true
-ma_hold_active_contract_without_llm: false
+ma_hold_active_contract_without_llm: true
 ma_hard_brake_decel_mps2: -3.0
 ma_near_miss_ttc_s: 1.5
 ma_near_miss_distance_m: 3.0
 ma_cutin_success_gap_m: 12.0
+ma_command_transition_warmup_frames: 3
 
 planner:
   controller_dt: 0.1
@@ -68,19 +69,28 @@ planner:
   control_trace_enabled: true
   control_trace_interval_s: 0.5
   actuation_velocity_assist_enabled: true
-  actuation_velocity_assist_debug_allow_set_target_velocity: true
+  actuation_velocity_assist_debug_allow_set_target_velocity: false
   actuation_velocity_assist_max_accel_mps2: 4.0
+  actuation_velocity_assist_max_jerk_mps3: 8.0
+  actuation_velocity_assist_shield_max_jerk_mps3: 8.0
   actuation_velocity_assist_max_speed_mps: 12.0
   actuation_velocity_assist_min_error_mps: 0.4
   actuation_velocity_assist_stall_recovery_enabled: true
-  actuation_velocity_assist_stall_speed_mps: 1.0
+  actuation_velocity_assist_stall_recovery_allow_set_target_velocity: true
+  actuation_velocity_assist_stall_recovery_max_accel_mps2: 2.0
+  actuation_velocity_assist_stall_recovery_max_jerk_mps3: 4.0
+  actuation_velocity_assist_stall_recovery_release_speed_mps: 3.0
+  actuation_velocity_assist_stall_recovery_max_target_lead_mps: 3.0
+  actuation_velocity_assist_stall_speed_mps: 2.0
   actuation_velocity_assist_stall_target_min_mps: 4.0
-  actuation_velocity_assist_stall_recovery_min_speed_mps: 3.0
+  actuation_velocity_assist_stall_recovery_min_speed_mps: 0.0
   actuation_velocity_assist_stall_front_gap_m: 8.0
   force_forward_gear_control: true
   realism_abort_grace_s: 2.5
   compress_realism_abort_grace_s: 4.0
   strike_commit_grace_s: 1.0
+  committed_danger_grace_s: 1.2
+  committed_danger_min_elapsed_ratio: 0.45
   realism_abort_consecutive_steps: 6
   plan_reuse_min_remaining_s: 0.8
   plan_reuse_same_tactic: true
@@ -99,7 +109,7 @@ planner:
   lane_center_offset_m: 0.0
   spline_smoothing: true
   min_runtime_lane_change_s: 2.2
-  max_runtime_lane_change_s: 5.0
+  max_runtime_lane_change_s: 6.5
   max_attack_speed_mps: 12.0
   merge_route_scan_distance_m: 60.0
 
@@ -107,15 +117,15 @@ planner:
     duration_s: 6.0
     min_speed_mps: 6.8
     striker_min_speed_mps: 7.0
-    striker_far_min_speed_mps: 3.0
-    striker_far_yield_margin_mps: 1.2
+    striker_far_min_speed_mps: 5.5
+    striker_far_yield_margin_mps: 0.4
     blocker_min_speed_mps: 6.8
     max_speed_mps: 10.5
 
   trajectory:
-    planning_time_budget_ms: 150
-    attack_candidate_budget_ms: 110
-    fallback_budget_ms: 30
+    planning_time_budget_ms: 420
+    attack_candidate_budget_ms: 340
+    fallback_budget_ms: 60
     max_candidate_count: 12
     max_candidate_count_hard: 16
     max_nearby_vehicle_count: 8
@@ -125,15 +135,15 @@ planner:
     reference_horizon_m: 100.0
     reference_cache_entries: 32
     dynamics_dt_s: 0.1
-    collision_dt_s: 0.025
+    collision_dt_s: 0.04
     collision_broad_phase_margin_m: 3.0
-    planning_limit_ratio: 0.8
+    planning_limit_ratio: 1.0
     wheelbase_m: 2.7
     max_front_wheel_angle_deg: 35.0
-    max_front_wheel_angle_rate_degps: 120.0
-    max_lateral_jerk_mps3: 6.0
-    max_abs_curvature_rate_s: 0.12
-    max_abs_curvature_rate_t: 0.8
+    max_front_wheel_angle_rate_degps: 180.0
+    max_lateral_jerk_mps3: 8.0
+    max_abs_curvature_rate_s: 0.18
+    max_abs_curvature_rate_t: 1.2
     same_tactic_prefix_s: 0.35
     tactic_switch_prefix_s: 0.15
     max_prefix_tracking_error_m: 1.5
@@ -211,10 +221,10 @@ planner:
     anchor_distances_m: [0, 5, 10, 15]
     # v2 offsets below are final longitudinal positions relative to ego; initializer subtracts anchor_distance_m before spawning.
     rolling_prestage_enabled: true
-    striker_prestage_range_m: [20.0, 35.0]
-    blocker_prestage_range_m: [10.0, 20.0]
-    striker_prestage_offsets_m: [22, 28, 34]
-    blocker_prestage_offsets_m: [10, 14, 18]
+    striker_prestage_range_m: [16.0, 28.0]
+    blocker_prestage_range_m: [6.0, 14.0]
+    striker_prestage_offsets_m: [18, 22, 26]
+    blocker_prestage_offsets_m: [6, 10, 14]
     striker_lead_range_m: [8.0, 9.0]
     blocker_side_offset_range_m: [-1.0, 3.0]
     striker_lead_offsets_m: [8, 9]
@@ -256,11 +266,12 @@ planner:
     compress_follow_ego_min_margin_mps: 1.2
 
   cut_in:
+    allow_aggressive_rate_limited_plan: true
     target_gap_m: 7.0
     target_gap_bounds_m: [6.0, 9.0]
     slot_gap_bounds_m: [6.0, 9.0]
     desired_slot_gap_m: 7.0
-    start_gap_bounds_m: [8.0, 34.0]
+    start_gap_bounds_m: [6.0, 34.0]
     predicted_slot_gap_bounds_m: [6.0, 9.0]
     predicted_slot_tolerance_m: 2.0
     min_blocker_clearance_m: 5.0
@@ -269,14 +280,20 @@ planner:
     lane_change_safety_factor: 1.4
     lookahead_distance_m: 3.5
     max_steer: 0.28
-    committed_timeout_s: 5.5
+    committed_timeout_s: 7.0
     lane_change_duration_s: 2.8
-    lane_change_duration_bounds_s: [2.0, 5.0]
+    lane_change_duration_bounds_s: [2.8, 6.5]
     merge_s_offset_m: 10.0
     merge_s_offset_bounds_m: [8.0, 25.0]
     target_speed_mps: 9.0
+    candidate_terminal_speed_offsets_mps: [-1.5, -1.0, -0.5, 0.0, 0.5]
+    committed_min_speed_mps: 5.5
+    launch_min_speed_mps: 5.0
+    hold_active_plan_during_committed: true
+    committed_plan_lock_s: 6.5
+    suppress_dynamics_only_shield_replan: true
     min_route_remaining_m: 20.0
-    max_lane_change_duration_s: 5.0
+    max_lane_change_duration_s: 6.5
     brake_start_delay_s: 0.0
     hold_after_merge_s: 0.5
     post_brake_duration_s: 0.0
@@ -307,7 +324,7 @@ planner:
     compress_gap_bounds_m: [14.0, 22.0]
     strike_gap_bounds_m: [10.0, 14.0]
     escape_target_gap_m: 2.5
-    escape_gap_bounds_m: [-2.0, 6.0]
+    escape_gap_bounds_m: [-4.0, 6.0]
     front_window_min_m: 8.0
     front_window_max_m: 24.0
     speed_delta_mps: 0.0

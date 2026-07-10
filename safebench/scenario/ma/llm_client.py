@@ -238,7 +238,7 @@ class OpenAICompatibleClient:
             "longitudinal_relation_to_ego", "speed_mps", "closing_speed_mps", "active_tactic",
             "striker_in_prepare_window", "striker_in_cutin_window", "actual_slot_gap_in_bounds",
             "predicted_slot_gap_m", "predicted_slot_gap_in_bounds", "predicted_slot_gap_close_to_final",
-            "predicted_cutin_slot_ready", "blocker_in_escape_window", "blocker_blocking_escape_lane",
+            "predicted_cutin_slot_ready", "cutin_launch_window_ready", "blocker_in_escape_window", "blocker_blocking_escape_lane",
             "blocker_sealing_ego_front", "ttc_s", "same_road_as_ego",
         )
         for actor in scene.get("attackers", []):
@@ -268,7 +268,7 @@ class OpenAICompatibleClient:
             "initial_attack_window_valid", "blocker_seal_success", "blocker_window_ready",
             "blocker_escape_window_ready", "blocker_front_window_ready",
             "striker_prepare_window_ready", "striker_cutin_window_ready", "predicted_cutin_slot_ready",
-            "striker_raw_cutin_gap_ready", "predicted_slot_gap_m", "escape_lane_blocked",
+            "striker_cutin_launch_window_ready", "striker_raw_cutin_gap_ready", "predicted_slot_gap_m", "escape_lane_blocked",
             "ego_front_clear", "min_ttc_s", "max_closing_speed_mps",
         )
         risk_keys = ("ma_event_cutin_success", "ma_event_hard_brake", "ma_event_near_miss", "ma_realism_violation_step", "ma_realism_violation_streak")

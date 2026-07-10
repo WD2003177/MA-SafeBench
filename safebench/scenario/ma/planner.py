@@ -135,10 +135,19 @@ class PrimitivePlanner:
         if max_lateral_accel_mps2 <= 0.0:
             return requested_s, None
         safety_factor = float(self.config.get("cut_in", {}).get("lane_change_safety_factor", 1.0))
-        min_duration = math.sqrt(max(0.0, 6.0 * lane_width_m / max_lateral_accel_mps2)) * max(1.0, safety_factor)
+        accel_duration = math.sqrt(max(0.0, 6.0 * lane_width_m / max_lateral_accel_mps2)) * max(1.0, safety_factor)
+        trajectory_cfg = self.config.get("trajectory", {})
+        planning_ratio = float(trajectory_cfg.get("planning_limit_ratio", 1.0))
+        lateral_jerk_limit = float(trajectory_cfg.get("max_lateral_jerk_mps3", 0.0)) * max(planning_ratio, 1e-3)
+        jerk_duration = 0.0
+        if lateral_jerk_limit > 0.0:
+            # Rest-to-rest quintic lateral motion has peak jerk 60 * lane_width / T^3.
+            jerk_duration = (60.0 * max(float(lane_width_m), 0.0) / lateral_jerk_limit) ** (1.0 / 3.0)
+        min_duration = max(accel_duration, jerk_duration)
         if requested_s >= min_duration:
             return requested_s, None
-        return min_duration, "lane_change_duration_extended_for_lateral_accel"
+        reason = "lane_change_duration_extended_for_lateral_jerk" if jerk_duration > accel_duration else "lane_change_duration_extended_for_lateral_accel"
+        return min_duration, reason
 
     def _speed_profile_with_accel_limit(self, start_speed: float, target_speed: float, ramp_duration: float, max_abs_accel: float):
         if max_abs_accel <= 0.0:
@@ -195,9 +204,10 @@ class PrimitivePlanner:
         desired_slot_gap = float(ir.params.get("target_gap_m", cfg.get("desired_slot_gap_m", cfg.get("target_gap_m", min_gap))))
         desired_slot_gap = max(min_gap, min(max_gap, desired_slot_gap))
         min_clearance = float(cfg.get("min_blocker_clearance_m", 5.0))
+        require_front_blocker = bool(self.config.get("initializer", {}).get("require_front_blocker_for_slot", True))
         blocker_gap = None
         blocker = actors.get("blocker_1") if isinstance(actors, dict) else None
-        if blocker is not None and blocker.is_alive:
+        if require_front_blocker and blocker is not None and blocker.is_alive:
             blocker_gap = self._same_lane_front_gap(ego_vehicle, blocker)
         if blocker_gap is None:
             slot_gap = desired_slot_gap
@@ -301,7 +311,7 @@ class PrimitivePlanner:
                 "escape_min_speed_mps",
                 default_min_speed,
             ))
-            if str(ir.params.get("phase", "") or "") == "compress":
+            if str(ir.params.get("phase", "") or "") in ("compress", "strike", "cut_in_committed"):
                 follow_margin = float(seal_cfg.get("escape_follow_ego_min_margin_mps", 1.0))
                 low_speed_threshold = float(seal_cfg.get("escape_apply_min_speed_above_ego_mps", 3.0))
                 rolling_min = float(seal_cfg.get("escape_compress_min_speed_mps", 0.0))
@@ -440,6 +450,21 @@ class PrimitivePlanner:
             planning_started + attack_budget_s + fallback_budget_s,
             planning_started + total_budget_s - 0.005,
         )
+        ego_wp = self._ego_waypoint(ego_vehicle)
+        if self._same_lane(actor_wp, ego_wp):
+            source = self._source_reference(actor_wp, deadline=attack_deadline)
+            validator = TrajectoryValidator(self.config, CarlaDataProvider.get_map())
+            return self._plan_cut_in_same_lane_gap_compression(
+                ir,
+                actor,
+                ego_vehicle,
+                source["line"],
+                source["lane_keys"],
+                validator,
+                fallback_deadline,
+                planning_started,
+                hard_replan=hard_replan,
+            )
         target_lane_wp = self._target_lane_from_actor(actor_wp, ir.side)
         if not self._same_direction_driving_lane(actor_wp, target_lane_wp):
             source = self._source_reference(actor_wp, deadline=attack_deadline)
@@ -456,6 +481,15 @@ class PrimitivePlanner:
                 ["cut_in_target_lane_unavailable_or_wrong_direction"],
             )
         slot_gap_m, blocker_gap_m, blocker_clearance_m, slot_source, desired_slot_gap_m, predicted_slot_gap_m = self._cut_in_slot(ir, actor, ego_vehicle, actors)
+        current_gap_m = self._relative_gap(ego_vehicle, actor)
+        slot_candidates = self._cut_in_slot_candidates(
+            ir,
+            current_gap_m,
+            slot_gap_m,
+            blocker_gap_m,
+            slot_source,
+            desired_slot_gap_m,
+        )
         v0 = max(0.0, self._speed_mps(actor))
         target_speed = self._gap_control_speed(ir, actor, ego_vehicle, "striker")
         lane_change_duration, duration_note = self._runtime_lane_change_duration(
@@ -478,6 +512,8 @@ class PrimitivePlanner:
                 fallback_deadline,
                 planning_started,
                 ["cut_in_target_lane_reference_unavailable"],
+                ego_vehicle=ego_vehicle,
+                desired_speed_mps=target_speed,
             )
         prefix = self._replanning_prefix(previous_plan, ir, hard_replan, actor)
         prefix = [
@@ -511,101 +547,145 @@ class PrimitivePlanner:
         max_accel = float(ir.constraints.max_abs_longitudinal_accel_mps2)
         nearby = self._nearby_vehicles(actor)
         validator = TrajectoryValidator(self.config, CarlaDataProvider.get_map())
-        max_candidates = min(
+        duration_offsets = [0.0, 0.6, 1.2, 1.8, 2.4, 3.0]
+        terminal_speed_offsets = self.config.get("cut_in", {}).get(
+            "candidate_terminal_speed_offsets_mps",
+            [-1.5, -1.0, -0.5, 0.0, 0.5],
+        )
+        base_max_candidates = min(
             int(self.trajectory_config.get("max_candidate_count", 12)),
             int(self.trajectory_config.get("max_candidate_count_hard", 16)),
         )
-        duration_offsets = [0.0, 0.4, 0.8, 1.2]
-        terminal_speed_offsets = [-0.5, 0.0, 0.5]
+        full_candidate_count = len(duration_offsets) * len(terminal_speed_offsets)
+        max_candidates = max(base_max_candidates, full_candidate_count) * max(1, len(slot_candidates))
         best = None
+        best_relaxed = None
         generated = 0
         rejected = []
         lane_duration_bounds = self.config.get("cut_in", {}).get("lane_change_duration_bounds_s", [2.0, 5.0])
         for duration_offset in duration_offsets:
             for terminal_speed_offset in terminal_speed_offsets:
+                for candidate_slot_gap_m, candidate_slot_source in slot_candidates:
+                    if generated >= max_candidates or time.perf_counter() >= attack_deadline:
+                        break
+                    change_s = max(float(lane_duration_bounds[0]), min(float(lane_duration_bounds[1]), lane_change_duration + duration_offset))
+                    suffix_lead_in_s = 0.0 if prefix and previous_plan is not None and previous_plan.tactic == ir.tactic else lead_in_s
+                    terminal_t = suffix_lead_in_s + change_s
+                    prediction_t = prefix_duration + terminal_t
+                    ego_speed = max(0.0, self._speed_mps(ego_vehicle))
+                    predicted_ego_s = ego_s + ego_speed * prediction_t + 0.5 * ego_accel * prediction_t * prediction_t
+                    terminal_s = predicted_ego_s + candidate_slot_gap_m
+                    predicted_ego_speed = max(0.0, ego_speed + ego_accel * prediction_t)
+                    nominal_terminal_speed = 0.5 * target_speed + 0.5 * predicted_ego_speed
+                    terminal_speed = max(0.0, nominal_terminal_speed + terminal_speed_offset)
+                    if not self._terminal_station_reachable(actor_s, v0, terminal_s, terminal_t, max_accel):
+                        rejected.append("terminal_station_unreachable")
+                        continue
+                    generated += 1
+                    trajectory = self._build_cut_in_candidate(
+                        source_line,
+                        target_line,
+                        actor_s,
+                        v0,
+                        longitudinal_accel,
+                        terminal_s,
+                        terminal_speed,
+                        0.0,
+                        suffix_lead_in_s,
+                        change_s,
+                        hold_after_merge,
+                        start_d=actor_d,
+                        start_d_speed=lateral_speed,
+                        start_d_accel=lateral_accel,
+                    )
+                    if not trajectory:
+                        rejected.append("candidate_generation_failed")
+                        continue
+                    if prefix:
+                        trajectory = prefix + self._shift_trajectory_time(trajectory[1:], prefix_duration)
+                        trajectory = enrich_trajectory_physics(
+                            [(point.t, point.transform, point.s, point.d) for point in trajectory],
+                            float(self.trajectory_config.get("wheelbase_m", 2.7)),
+                            math.radians(float(self.trajectory_config.get("max_front_wheel_angle_deg", 35.0))),
+                        )
+                    if any(source_line.sample(point.s).is_junction or target_line.sample(point.s).is_junction for point in trajectory):
+                        rejected.append("junction_or_lane_discontinuity")
+                        continue
+                    validation = validator.validate(
+                        trajectory,
+                        actor,
+                        nearby,
+                        bundle["lane_keys"],
+                        deadline=attack_deadline,
+                    )
+                    if blocker_gap_m is not None:
+                        blocker = actors.get("blocker_1")
+                        blocker_s = source_line.project(blocker.get_transform().location) if blocker is not None else None
+                        if blocker_s is not None:
+                            predicted_blocker_s = blocker_s + self._speed_mps(blocker) * prediction_t + 0.5 * self._longitudinal_accel(blocker) * prediction_t * prediction_t
+                            if predicted_blocker_s - terminal_s < float(self.config.get("cut_in", {}).get("min_blocker_clearance_m", 5.0)):
+                                validation.feasible = False
+                                validation.feasibility_status = "invalid_unrealistic"
+                                validation.reasons.append("predicted_blocker_clearance")
+                    gap_error = abs((terminal_s - predicted_ego_s) - candidate_slot_gap_m)
+                    desired_gap_error = abs(candidate_slot_gap_m - desired_slot_gap_m)
+                    validation.candidate_score += 5.0 * gap_error + 0.1 * desired_gap_error + 0.05 * terminal_t
+                    if not validation.feasible:
+                        rejected.extend(validation.reasons)
+                        if self._aggressive_cut_in_candidate_allowed(validation, ego_vehicle=ego_vehicle):
+                            relaxed = (trajectory, validation, change_s, terminal_speed, candidate_slot_gap_m, candidate_slot_source)
+                            if best_relaxed is None or validation.candidate_score < best_relaxed[1].candidate_score:
+                                best_relaxed = relaxed
+                        continue
+                    if best is None or validation.candidate_score < best[1].candidate_score:
+                        best = (trajectory, validation, change_s, terminal_speed, candidate_slot_gap_m, candidate_slot_source)
                 if generated >= max_candidates or time.perf_counter() >= attack_deadline:
                     break
-                change_s = max(float(lane_duration_bounds[0]), min(float(lane_duration_bounds[1]), lane_change_duration + duration_offset))
-                suffix_lead_in_s = 0.0 if prefix and previous_plan is not None and previous_plan.tactic == ir.tactic else lead_in_s
-                terminal_t = suffix_lead_in_s + change_s
-                prediction_t = prefix_duration + terminal_t
-                ego_speed = max(0.0, self._speed_mps(ego_vehicle))
-                predicted_ego_s = ego_s + ego_speed * prediction_t + 0.5 * ego_accel * prediction_t * prediction_t
-                terminal_s = predicted_ego_s + slot_gap_m
-                predicted_ego_speed = max(0.0, ego_speed + ego_accel * prediction_t)
-                nominal_terminal_speed = 0.5 * target_speed + 0.5 * predicted_ego_speed
-                terminal_speed = max(0.0, nominal_terminal_speed + terminal_speed_offset)
-                if not self._terminal_station_reachable(actor_s, v0, terminal_s, terminal_t, max_accel):
-                    rejected.append("terminal_station_unreachable")
-                    continue
-                generated += 1
-                trajectory = self._build_cut_in_candidate(
-                    source_line,
-                    target_line,
-                    actor_s,
-                    v0,
-                    longitudinal_accel,
-                    terminal_s,
-                    terminal_speed,
-                    0.0,
-                    suffix_lead_in_s,
-                    change_s,
-                    hold_after_merge,
-                    start_d=actor_d,
-                    start_d_speed=lateral_speed,
-                    start_d_accel=lateral_accel,
-                )
-                if not trajectory:
-                    rejected.append("candidate_generation_failed")
-                    continue
-                if prefix:
-                    trajectory = prefix + self._shift_trajectory_time(trajectory[1:], prefix_duration)
-                    trajectory = enrich_trajectory_physics(
-                        [(point.t, point.transform, point.s, point.d) for point in trajectory],
-                        float(self.trajectory_config.get("wheelbase_m", 2.7)),
-                        math.radians(float(self.trajectory_config.get("max_front_wheel_angle_deg", 35.0))),
-                    )
-                if any(source_line.sample(point.s).is_junction or target_line.sample(point.s).is_junction for point in trajectory):
-                    rejected.append("junction_or_lane_discontinuity")
-                    continue
-                validation = validator.validate(
-                    trajectory,
-                    actor,
-                    nearby,
-                    bundle["lane_keys"],
-                    deadline=attack_deadline,
-                )
-                if blocker_gap_m is not None:
-                    blocker = actors.get("blocker_1")
-                    blocker_s = source_line.project(blocker.get_transform().location) if blocker is not None else None
-                    if blocker_s is not None:
-                        predicted_blocker_s = blocker_s + self._speed_mps(blocker) * prediction_t + 0.5 * self._longitudinal_accel(blocker) * prediction_t * prediction_t
-                        if predicted_blocker_s - terminal_s < float(self.config.get("cut_in", {}).get("min_blocker_clearance_m", 5.0)):
-                            validation.feasible = False
-                            validation.feasibility_status = "invalid_unrealistic"
-                            validation.reasons.append("predicted_blocker_clearance")
-                if not validation.feasible:
-                    rejected.extend(validation.reasons)
-                    continue
-                gap_error = abs((terminal_s - predicted_ego_s) - slot_gap_m)
-                validation.candidate_score += 5.0 * gap_error + 0.05 * terminal_t
-                if best is None or validation.candidate_score < best[1].candidate_score:
-                    best = (trajectory, validation, change_s, terminal_speed)
             if generated >= max_candidates or time.perf_counter() >= attack_deadline:
                 break
         if best is None:
-            return self._plan_safe_fallback(
-                ir,
-                actor,
-                source_line,
-                bundle["source_lane_keys"],
-                nearby,
-                validator,
-                fallback_deadline,
-                planning_started,
-                rejected,
-            )
-        trajectory, validation, selected_duration, selected_speed = best
+            if best_relaxed is not None:
+                best = best_relaxed
+                best[1].feasibility_status = "rate_limited_execution"
+                best[1].feasible = True
+                rejected.append("aggressive_rate_limited_cut_in_selected")
+            else:
+                fallback_context = {
+                    "current_gap_m": current_gap_m,
+                    "slot_gap_m": slot_gap_m,
+                    "desired_slot_gap_m": desired_slot_gap_m,
+                    "predicted_slot_gap_m": predicted_slot_gap_m,
+                    "blocker_gap_m": blocker_gap_m,
+                    "blocker_clearance_m": blocker_clearance_m,
+                    "slot_source": slot_source,
+                    "slot_candidates": [
+                        {"gap_m": gap, "source": source}
+                        for gap, source in slot_candidates
+                    ],
+                    "generated_candidate_count": generated,
+                    "candidate_duration_offsets_s": duration_offsets,
+                    "candidate_terminal_speed_offsets_mps": terminal_speed_offsets,
+                    "lane_change_duration_s": lane_change_duration,
+                    "lane_change_duration_note": duration_note,
+                    "lead_in_time_s": lead_in_s,
+                    "replan_prefix_duration_s": prefix_duration,
+                    "planning_budget_exhausted": time.perf_counter() >= attack_deadline,
+                }
+                return self._plan_safe_fallback(
+                    ir,
+                    actor,
+                    source_line,
+                    bundle["source_lane_keys"],
+                    nearby,
+                    validator,
+                    fallback_deadline,
+                    planning_started,
+                    rejected,
+                    ego_vehicle=ego_vehicle,
+                    desired_speed_mps=target_speed,
+                    fallback_context=fallback_context,
+                )
+        trajectory, validation, selected_duration, selected_speed, selected_slot_gap_m, selected_slot_source = best
         path = [point.transform for point in trajectory]
         speed_profile = [(point.t, point.speed_mps) for point in trajectory]
         horizon = trajectory[-1].t
@@ -617,26 +697,38 @@ class PrimitivePlanner:
         notes.append("world_space_trajectory_validation")
         notes.append("slot_aware_ego_blocker_cut_in")
         notes.append("time_budgeted_candidate_search")
+        if selected_slot_source != slot_source:
+            notes.append(selected_slot_source)
+        if validation.feasibility_status == "rate_limited_execution":
+            notes.append("aggressive_rate_limited_cut_in")
         planning_elapsed_ms = (time.perf_counter() - planning_started) * 1000.0
         resolved = {
+            "phase": ir.params.get("phase"),
             "target_speed_mps": selected_speed,
             "lane_change_duration_s": selected_duration,
             "target_gap_m": ir.params.get("target_gap_m"),
-            "merge_s_offset_m": slot_gap_m,
-            "slot_gap_m": slot_gap_m,
+            "merge_s_offset_m": selected_slot_gap_m,
+            "slot_gap_m": selected_slot_gap_m,
             "desired_slot_gap_m": desired_slot_gap_m,
-            "final_slot_gap_m": slot_gap_m,
+            "final_slot_gap_m": selected_slot_gap_m,
             "predicted_slot_gap_m": predicted_slot_gap_m,
             "blocker_gap_m": blocker_gap_m,
             "blocker_clearance_m": blocker_clearance_m,
             "slot_adjust_reason": slot_source,
             "slot_source": slot_source,
+            "selected_slot_source": selected_slot_source,
+            "selected_slot_gap_m": selected_slot_gap_m,
+            "current_gap_m": current_gap_m,
             "lead_in_time_s": lead_in_s,
             "replan_prefix_duration_s": prefix_duration,
+            "hard_replan": bool(hard_replan),
             "generated_candidate_count": generated,
             "rejected_candidate_reasons": list(dict.fromkeys(rejected)),
             "planning_elapsed_ms": planning_elapsed_ms,
             "planning_budget_exhausted": time.perf_counter() >= attack_deadline,
+            "collision_actor_id": getattr(validation, "collision_actor_id", None),
+            "aggressive_rate_limited_cut_in": validation.feasibility_status == "rate_limited_execution",
+            "aggressive_validation_reasons": list(validation.reasons) if validation.feasibility_status == "rate_limited_execution" else [],
         }
         return PlannedBehavior(
             ir.command_id,
@@ -658,6 +750,214 @@ class PrimitivePlanner:
             validation_result=validation,
             requested_tactic=ir.tactic,
         )
+
+    def _same_lane(self, first_wp, second_wp) -> bool:
+        return bool(
+            first_wp is not None
+            and second_wp is not None
+            and int(first_wp.road_id) == int(second_wp.road_id)
+            and int(first_wp.lane_id) == int(second_wp.lane_id)
+        )
+
+    def _plan_cut_in_same_lane_gap_compression(
+        self,
+        ir: BehaviorIR,
+        actor,
+        ego_vehicle,
+        source_line,
+        lane_keys,
+        validator,
+        fallback_deadline,
+        planning_started,
+        hard_replan: bool = False,
+    ) -> PlannedBehavior:
+        start_s = source_line.project(actor.get_transform().location)
+        start_speed = max(0.0, self._speed_mps(actor))
+        start_accel = self._longitudinal_accel(actor)
+        duration = float(self.config.get("cut_in", {}).get(
+            "committed_gap_compression_horizon_s",
+            self.trajectory_config.get("fallback_horizon_s", 2.5),
+        ))
+        duration = max(1.0, duration)
+        target_speed = self._gap_control_speed(ir, actor, ego_vehicle, "striker")
+        terminal_s = start_s + max(0.0, 0.5 * (start_speed + target_speed) * duration)
+        trajectory = self._build_lane_follow_candidate(
+            source_line,
+            start_s,
+            start_speed,
+            start_accel,
+            terminal_s,
+            target_speed,
+            0.0,
+            duration,
+        )
+        validation = validator.validate(
+            trajectory,
+            actor,
+            self._nearby_vehicles(actor),
+            lane_keys,
+            deadline=fallback_deadline,
+        )
+        if not validation.feasible:
+            return self._plan_safe_fallback(
+                ir,
+                actor,
+                source_line,
+                lane_keys,
+                self._nearby_vehicles(actor),
+                validator,
+                fallback_deadline,
+                planning_started,
+                validation.reasons,
+                ego_vehicle=ego_vehicle,
+                desired_speed_mps=target_speed,
+            )
+        gap = self._relative_gap(ego_vehicle, actor)
+        resolved = {
+            "phase": ir.params.get("phase"),
+            "target_speed_mps": target_speed,
+            "target_gap_m": ir.params.get("target_gap_m"),
+            "current_gap_m": gap,
+            "same_lane_gap_compression": True,
+            "hard_replan": bool(hard_replan),
+            "planning_elapsed_ms": (time.perf_counter() - planning_started) * 1000.0,
+        }
+        return PlannedBehavior(
+            ir.command_id,
+            ir.actor_name,
+            ir.actor_id,
+            ir.behavior,
+            ir.tactic,
+            ir.start_time_s,
+            trajectory[-1].t,
+            [point.transform for point in trajectory],
+            [(point.t, point.speed_mps) for point in trajectory],
+            ir.termination,
+            ir.fallback,
+            planner_status="planned",
+            planner_notes=["same_lane_committed_cut_in_gap_compression", "validated_lane_follow"],
+            resolved_physical_params=resolved,
+            trajectory=trajectory,
+            execution_mode="attack",
+            feasibility_status=validation.feasibility_status,
+            validation_result=validation,
+            requested_tactic=ir.tactic,
+        )
+
+    def _aggressive_cut_in_candidate_allowed(self, validation, ego_vehicle=None) -> bool:
+        if not bool(self.config.get("cut_in", {}).get("allow_aggressive_rate_limited_plan", True)):
+            return False
+        hard_reasons = {
+            "predicted_blocker_clearance",
+            "junction_or_lane_discontinuity",
+            "longitudinal_non_monotonic",
+            "speed_mps_limit",
+            "validation_time_budget_exhausted",
+        }
+        collision_actor_id = getattr(validation, "collision_actor_id", None)
+        ego_id = getattr(ego_vehicle, "id", None)
+        ego_collision = "predicted_collision" in set(getattr(validation, "reasons", []) or []) and ego_id is not None and collision_actor_id == ego_id
+        if not ego_collision:
+            hard_reasons.add("predicted_collision")
+        if not bool(self.config.get("cut_in", {}).get("aggressive_allow_footprint_corridor_violation", True)):
+            hard_reasons.add("vehicle_footprint_outside_corridor")
+        reasons = set(getattr(validation, "reasons", []) or [])
+        if not reasons or reasons & hard_reasons:
+            return False
+        dynamic_reasons = {
+            "longitudinal_accel_mps2_limit",
+            "longitudinal_jerk_mps3_limit",
+            "lateral_accel_mps2_limit",
+            "lateral_jerk_mps3_limit",
+            "curvature_rate_s_limit",
+            "curvature_rate_t_limit",
+            "front_wheel_angle_rad_limit",
+            "front_wheel_angle_rate_radps_limit",
+        }
+        if reasons & dynamic_reasons:
+            return False
+        soft_reasons = {
+            "vehicle_footprint_outside_corridor",
+            "collision_check_time_budget_exhausted",
+        }
+        return reasons.issubset(soft_reasons)
+
+    def _cut_in_slot_candidates(
+        self,
+        ir: BehaviorIR,
+        current_gap_m: float,
+        slot_gap_m: float,
+        blocker_gap_m: Optional[float],
+        slot_source: str,
+        desired_slot_gap_m: float,
+    ) -> List[Tuple[float, str]]:
+        cfg = self.config.get("cut_in", self.config.get("cut_in_and_brake", {}))
+        candidates: List[Tuple[float, str]] = []
+        min_clearance = float(cfg.get("min_blocker_clearance_m", 5.0))
+        max_with_blocker = blocker_gap_m - min_clearance if blocker_gap_m is not None else None
+
+        def add(gap_value: Any, source: str) -> None:
+            try:
+                gap = float(gap_value)
+            except (TypeError, ValueError):
+                return
+            if not math.isfinite(gap) or gap <= 0.0:
+                return
+            if max_with_blocker is not None and gap > max_with_blocker + 1e-6:
+                return
+            for existing, _ in candidates:
+                if abs(existing - gap) <= 0.25:
+                    return
+            candidates.append((gap, source))
+
+        launch_bounds = cfg.get("launch_commit_gap_bounds_m")
+        if not isinstance(launch_bounds, (list, tuple)) or len(launch_bounds) < 2:
+            launch_bounds = self.config.get("initializer", {}).get(
+                "striker_prepare_window_m",
+                cfg.get("start_gap_bounds_m", [8.0, 18.0]),
+            )
+        try:
+            launch_lower = float(launch_bounds[0])
+            launch_upper = float(launch_bounds[1])
+        except (TypeError, ValueError, IndexError):
+            launch_lower, launch_upper = 8.0, 18.0
+
+        front_brake_cfg = self.config.get("front_brake", {})
+        brake_setup_gap = None
+        if isinstance(front_brake_cfg, dict):
+            try:
+                brake_min_gap = float(front_brake_cfg.get("min_gap_m", 4.0))
+                brake_max_gap = float(front_brake_cfg.get("max_gap_m", 15.0))
+                if math.isfinite(brake_min_gap) and math.isfinite(brake_max_gap) and brake_max_gap > brake_min_gap:
+                    brake_setup_gap = _clamp(
+                        float(cfg.get("brake_setup_gap_m", brake_max_gap - 3.0)),
+                        brake_min_gap,
+                        brake_max_gap,
+                    )
+            except (TypeError, ValueError):
+                brake_setup_gap = None
+
+        deferred_launch_gaps: List[float] = []
+        for gap in (ir.params.get("predicted_slot_gap_m"), current_gap_m):
+            try:
+                raw_gap = float(gap)
+            except (TypeError, ValueError):
+                continue
+            if launch_lower <= raw_gap <= launch_upper and raw_gap > desired_slot_gap_m + 0.5:
+                if (
+                    brake_setup_gap is not None
+                    and raw_gap > brake_setup_gap
+                    and launch_lower <= brake_setup_gap <= launch_upper
+                    and brake_setup_gap > desired_slot_gap_m + 0.5
+                ):
+                    add(brake_setup_gap, "launch_gap_lateral_commit")
+                    deferred_launch_gaps.append(raw_gap)
+                else:
+                    add(raw_gap, "launch_gap_lateral_commit")
+        add(slot_gap_m, slot_source)
+        for raw_gap in deferred_launch_gaps:
+            add(raw_gap, "launch_gap_lateral_commit")
+        return candidates
 
     def _reference_bundle(self, actor_wp, side: str, deadline: Optional[float] = None) -> Dict[str, Any]:
         carla_map = CarlaDataProvider.get_map()
@@ -800,6 +1100,8 @@ class PrimitivePlanner:
             return []
         if ir.tactic in ("front_brake", "recover"):
             return []
+        if ir.tactic == "cut_in" and previous_plan.tactic != "cut_in":
+            return []
         same_tactic = previous_plan.tactic == ir.tactic
         duration = float(
             self.trajectory_config.get(
@@ -937,6 +1239,7 @@ class PrimitivePlanner:
         rejected_reasons,
         ego_vehicle=None,
         desired_speed_mps=None,
+        fallback_context=None,
     ):
         start_s = source_line.project(actor.get_transform().location)
         start_speed = max(0.0, self._speed_mps(actor))
@@ -1027,8 +1330,39 @@ class PrimitivePlanner:
                 raise ValueError("no_physically_valid_fallback:%s" % ",".join(validation.reasons))
             best = (trajectory, validation, "emergency_brake")
         trajectory, validation, mode = best
-        execution_mode = "emergency" if mode == "emergency_brake" else "fallback"
+        phase = str(ir.params.get("phase", "") or "")
+        tactical_lane_follow_fallback = (
+            mode != "emergency_brake"
+            and ir.tactic in ("gain_lead", "slot_sync", "seal_escape")
+            and phase in ("prestage", "compress")
+        )
+        cut_in_gap_compression_fallback = (
+            mode != "emergency_brake"
+            and ir.tactic == "cut_in"
+            and phase in ("strike", "cut_in_committed")
+        )
+        execution_mode = "attack" if tactical_lane_follow_fallback else ("emergency" if mode == "emergency_brake" else "fallback")
+        feasibility_status = "rate_limited_execution" if tactical_lane_follow_fallback else validation.feasibility_status
         elapsed_ms = (time.perf_counter() - planning_started) * 1000.0
+        fallback_target_speed = max(float(point.speed_mps) for point in trajectory)
+        planner_notes = ["validated_lane_follow_fallback", mode]
+        if tactical_lane_follow_fallback:
+            planner_notes.append("tactical_lane_follow_fallback_executable")
+        if cut_in_gap_compression_fallback:
+            planner_notes.append("cut_in_gap_compression_fallback_non_committal")
+        resolved = {
+            "phase": phase,
+            "target_speed_mps": fallback_target_speed,
+            "target_gap_m": ir.params.get("target_gap_m"),
+            "fallback_mode": mode,
+            "fallback_neighbor_risk": neighbor_risk,
+            "fallback_motion_floor_mps": motion_floor,
+            "fallback_reachable_motion_floor_mps": reachable_motion_floor,
+            "planning_elapsed_ms": elapsed_ms,
+            "attack_candidate_rejections": list(dict.fromkeys(rejected_reasons)),
+        }
+        if isinstance(fallback_context, dict):
+            resolved.update(fallback_context)
         return PlannedBehavior(
             ir.command_id,
             ir.actor_name,
@@ -1042,18 +1376,11 @@ class PrimitivePlanner:
             ir.termination,
             ir.fallback,
             planner_status="fallback",
-            planner_notes=["validated_lane_follow_fallback", mode],
-            resolved_physical_params={
-                "fallback_mode": mode,
-                "fallback_neighbor_risk": neighbor_risk,
-                "fallback_motion_floor_mps": motion_floor,
-                "fallback_reachable_motion_floor_mps": reachable_motion_floor,
-                "planning_elapsed_ms": elapsed_ms,
-                "attack_candidate_rejections": list(dict.fromkeys(rejected_reasons)),
-            },
+            planner_notes=planner_notes,
+            resolved_physical_params=resolved,
             trajectory=trajectory,
             execution_mode=execution_mode,
-            feasibility_status=validation.feasibility_status,
+            feasibility_status=feasibility_status,
             validation_result=validation,
             requested_tactic=ir.tactic,
             fallback_reason="no_normal_feasible_attack_candidate",
@@ -1061,6 +1388,13 @@ class PrimitivePlanner:
 
     def _fallback_motion_floor(self, ir, ego_vehicle, desired_speed_mps=None) -> float:
         phase = str(ir.params.get("phase", "") or "")
+        if phase in ("strike", "cut_in_committed") and ir.tactic == "cut_in":
+            cfg = self.config.get("cut_in", {})
+            ego_speed = self._speed_mps(ego_vehicle) if ego_vehicle is not None else 0.0
+            configured = float(cfg.get("strike_fallback_min_speed_mps", cfg.get("min_speed_mps", 0.0)))
+            margin = float(cfg.get("strike_fallback_follow_ego_margin_mps", 1.0))
+            desired = float(desired_speed_mps) if desired_speed_mps is not None else 0.0
+            return max(0.0, configured, ego_speed - margin, desired)
         if phase not in ("prestage", "compress") or ir.tactic not in ("gain_lead", "slot_sync", "seal_escape"):
             return 0.0
         ego_speed = self._speed_mps(ego_vehicle) if ego_vehicle is not None else 0.0

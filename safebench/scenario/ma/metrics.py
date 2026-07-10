@@ -41,6 +41,7 @@ class MARiskMetrics:
         self.max_abs_jerk = float(config.get("max_abs_jerk_mps3", 8.0))
         self.max_lateral_accel = float(config.get("max_lateral_accel_mps2", 3.5))
         self.max_heading_error_deg = float(config.get("max_heading_error_deg", 45.0))
+        self.command_transition_warmup_frames = max(1, int(config.get("command_transition_warmup_frames", 3)))
         self.reset()
 
     def reset(self) -> None:
@@ -51,6 +52,7 @@ class MARiskMetrics:
         self.prev_actor_lateral_accels = {}
         self.prev_actor_curvatures = {}
         self.prev_active_commands = {}
+        self.command_warmup_remaining = {}
         self.episode_min_ttc = float("inf")
         self.episode_min_distance = float("inf")
         self.episode_ego_max_decel = 0.0
@@ -115,16 +117,33 @@ class MARiskMetrics:
                 step_min_ttc = min(step_min_ttc, rel_gap / rel_speed)
             strict_wp = carla_map.get_waypoint(actor.get_transform().location, project_to_road=False, lane_type=carla.LaneType.Driving)
             wp = carla_map.get_waypoint(actor.get_transform().location, project_to_road=True, lane_type=carla.LaneType.Driving)
-            if strict_wp is None:
+            plan_meta = active_plan_meta.get(name, {}) if isinstance(active_plan_meta, dict) else {}
+            plan_attack_executable = bool(plan_meta.get("attack_executable")) if isinstance(plan_meta, dict) else False
+            if plan_attack_executable and strict_wp is None:
                 step_offroad = True
                 self._add_realism_reason(name, "offroad", 1.0, 0.0)
-            plan_meta = active_plan_meta.get(name, {}) if isinstance(active_plan_meta, dict) else {}
             command_id = plan_meta.get("command_id") if isinstance(plan_meta, dict) else None
             if command_id is None and active_behaviors.get(name):
                 command_id = "%s:%s" % (name, active_behaviors.get(name))
             command_changed = command_id is not None and command_id != self.prev_active_commands.get(name)
-            self._update_actor_realism(name, actor, wp, dt, warmup_excluded=bool(command_changed), command_id=command_id)
-            plan_attack_executable = bool(plan_meta.get("attack_executable")) if isinstance(plan_meta, dict) else False
+            if command_changed:
+                self.command_warmup_remaining[name] = self.command_transition_warmup_frames
+                self.prev_actor_accels.pop(name, None)
+                self.prev_actor_lateral_accels.pop(name, None)
+                self.prev_actor_curvatures.pop(name, None)
+            warmup_frames = int(self.command_warmup_remaining.get(name, 0))
+            warmup_excluded = warmup_frames > 0
+            self._update_actor_realism(
+                name,
+                actor,
+                wp,
+                dt,
+                warmup_excluded=warmup_excluded,
+                command_id=command_id,
+                realism_active=plan_attack_executable,
+            )
+            if warmup_frames > 0:
+                self.command_warmup_remaining[name] = warmup_frames - 1
             if ego_wp is not None and wp is not None and wp.road_id == ego_wp.road_id and wp.lane_id == ego_wp.lane_id and 0.0 < rel_gap <= self.cutin_gap_m:
                 if active_behaviors.get(name) in ("cut_in", "cut_in_and_brake"):
                     step_cutin_success = step_cutin_success or plan_attack_executable
@@ -134,7 +153,7 @@ class MARiskMetrics:
                 jump = loc.distance(prev)
                 max_jump = max(max_jump, jump)
                 margin = _speed(actor) * dt + 3.0
-                if jump > margin:
+                if plan_attack_executable and jump > margin:
                     step_teleport = True
                     self._add_realism_reason(name, "teleport", jump, margin)
             self.prev_actor_locations[name] = carla.Location(loc.x, loc.y, loc.z)
@@ -193,7 +212,7 @@ class MARiskMetrics:
         return self.step_record
 
 
-    def _update_actor_realism(self, name: str, actor, waypoint, dt: float, warmup_excluded: bool = False, command_id: str = None) -> bool:
+    def _update_actor_realism(self, name: str, actor, waypoint, dt: float, warmup_excluded: bool = False, command_id: str = None, realism_active: bool = True) -> bool:
         try:
             transform = actor.get_transform()
             accel = actor.get_acceleration()
@@ -226,6 +245,7 @@ class MARiskMetrics:
                 "raw_curvature_rate_t": float(curvature_rate_t),
                 "raw_normalized_steer": float(actor.get_control().steer),
                 "warmup_excluded": bool(warmup_excluded),
+                "attack_executable": bool(realism_active),
             }
             plan_meta = getattr(self, "_active_plan_meta", {}).get(name, {})
             shield = plan_meta.get("shield", {}) if isinstance(plan_meta, dict) else {}
@@ -237,6 +257,8 @@ class MARiskMetrics:
                 "shield_intervention": bool(shield.get("intervention", False)),
                 "shield_replan_requested": abs(float(shield.get("last_replan_s", -1e9)) - self._current_sim_time_s) <= dt,
             })
+            if not realism_active:
+                return False
             if not warmup_excluded:
                 self.episode_attacker_max_abs_accel = max(self.episode_attacker_max_abs_accel, abs(lon_accel))
             if not warmup_excluded:

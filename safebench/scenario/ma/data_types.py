@@ -19,7 +19,7 @@ PHASE_ALLOWED_TACTICS = {
     "observe": tuple(),
     "compress": ("gain_lead", "slot_sync", "seal_escape"),
     "strike": ("cut_in", "seal_escape"),
-    "cut_in_committed": ("cut_in", "seal_escape"),
+    "cut_in_committed": ("cut_in", "front_brake", "seal_escape"),
     "brake_pulse": ("front_brake", "seal_escape"),
     "recover": ("recover",),
 }
@@ -116,6 +116,7 @@ class TrajectoryValidationResult:
     candidate_score: float = float("inf")
     checked_points: int = 0
     collision_checks: int = 0
+    collision_actor_id: Optional[int] = None
 
 
 def is_attack_executable(plan: Any) -> bool:

@@ -222,6 +222,14 @@ class MAIntentCompiler:
                 params["target_gap_m"] = blocker_gap
                 param_sources["target_gap_m"] = "resolved_from_escape_block_gap" if meta.side in ("left", "right") else "resolved_from_blocker_seal_gap"
         else:
+            if tactic == "seal_escape" and meta.side in ("left", "right"):
+                params["escape_blocking"] = True
+                params["block_escape_side"] = meta.side
+                seal_cfg = self.planner_config.get("seal_escape", {})
+                blocker_bounds = seal_cfg.get("escape_gap_bounds_m", [-2.0, 6.0])
+                blocker_gap = _clamp(float(seal_cfg.get("escape_target_gap_m", sum(blocker_bounds) / 2.0)), blocker_bounds)
+                params["target_gap_m"] = blocker_gap
+                param_sources["target_gap_m"] = "resolved_from_escape_block_gap"
             param_sources.setdefault("target_gap_m", "resolved_from_defaults")
             param_sources.setdefault("merge_s_offset_m", "resolved_from_defaults")
         rule_rejection = self._command_verifier_rejection(
@@ -746,13 +754,15 @@ class MAIntentCompiler:
         actual_slot_gap_in_bounds = float(predicted_bounds[0]) <= gap <= float(predicted_bounds[1])
         predicted_in_bounds = float(predicted_bounds[0]) <= predicted_gap <= float(predicted_bounds[1])
         predicted_close_to_final = abs(predicted_gap - final_slot) <= tolerance
-        if not actual_slot_gap_in_bounds and not predicted_in_bounds and not predicted_close_to_final:
+        launch_window_ready = min_gap <= gap <= max_gap
+        if not launch_window_ready and not actual_slot_gap_in_bounds and not predicted_in_bounds and not predicted_close_to_final:
             return "predicted_slot_gap_invalid"
         params["predicted_cutin_gap_m"] = predicted_gap
         params["desired_slot_gap_m"] = desired_slot
         params["final_slot_gap_m"] = final_slot
         params["predicted_slot_gap_m"] = predicted_gap
         params["predicted_slot_gap_bounds_m"] = [float(predicted_bounds[0]), float(predicted_bounds[1])]
+        params["cutin_launch_window_ready"] = launch_window_ready
         params["actual_slot_gap_in_bounds"] = actual_slot_gap_in_bounds
         params["predicted_slot_gap_in_bounds"] = predicted_in_bounds
         params["predicted_slot_gap_close_to_final"] = predicted_close_to_final
